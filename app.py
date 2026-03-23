@@ -17,7 +17,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("feishu_gitlab_card_http")
-CARD_STATE: Dict[str, Dict[str, str]] = {}
+CARD_STATE: Dict[str, Dict[str, Any]] = {}
 ACTION_DEDUP: Dict[str, float] = {}
 RUN_DEDUP_SECONDS = 4.0
 REFRESH_DEDUP_SECONDS = 1.5
@@ -52,9 +52,63 @@ async def delayed_update_card(feishu_client: "FeishuClient", open_message_id: st
         logger.exception("delayed update current card failed open_message_id=%s", open_message_id)
 
 
+async def poll_pipeline_status(feishu_client, gitlab_client, cfg, project_id, pipeline_id, open_message_id, state, operator_open_id=None, open_chat_id=None):
+    for i in range(120):  # poll up to 10 minutes (120 * 5s)
+        await asyncio.sleep(5)
+        try:
+            pipeline = gitlab_client.get_pipeline(project_id, pipeline_id)
+            if not pipeline:
+                continue
+            
+            p_status = pipeline.get("status", "created")
+            
+            jobs = gitlab_client.get_pipeline_jobs(project_id, pipeline_id)
+            active_jobs = [j for j in jobs if j.get("status") == "running"]
+            if not active_jobs:
+                active_jobs = [j for j in jobs if j.get("status") == "pending"]
+            active_job_name = active_jobs[0]["name"] if active_jobs else "阶段衔接中"
+            
+            latest_pipeline_text = f"#{pipeline_id} / {p_status}"
+            helper_line = f"⏳ 流水线运行中 [持续追踪]：正在跟进 {active_job_name}..."
+
+            if p_status == "success":
+                status = "就绪"
+                helper_line = f"✅ Pipeline #{pipeline_id} 终于跑完啦！本次执行成功！🎉"
+            elif p_status in {"failed", "canceled"}:
+                status = "异常"
+                helper_line = f"❌ Pipeline #{pipeline_id} 执行终止: {p_status}"
+            else:
+                status = "处理中"
+                
+            card = build_card(
+                cfg,
+                status=status,
+                state=state,
+                latest_pipeline_text=latest_pipeline_text,
+                latest_result_text=helper_line,
+                show_details=True,
+            )
+            feishu_client.update_card(open_message_id, card)
+            
+            if p_status in {"success", "failed", "canceled"}:
+                try:
+                    if operator_open_id and open_chat_id:
+                        msg_text = ""
+                        if p_status == "success":
+                            msg_text = f"<at user_id=\"{operator_open_id}\"></at> 您触发的 {state['project']} - {state['repo']} ({state['branch']}) 发版任务已执行成功！✅"
+                        else:
+                            msg_text = f"<at user_id=\"{operator_open_id}\"></at> 您触发的 {state['project']} - {state['repo']} ({state['branch']}) 发版任务已终止 (状态: {p_status}) ❌"
+                        feishu_client.send_text(open_chat_id, msg_text)
+                except Exception as e:
+                    logger.error("send notify text error %s", e)
+                break
+        except Exception as e:
+            logger.error("poll pipeline error %s", e)
+
+
 def load_config() -> Dict[str, Any]:
     if not CONFIG_PATH.exists():
-        raise FileNotFoundError(f"Missing config.yaml. Copy from {CONFIG_PATH.with_name('config.example.yaml')}")
+        raise FileNotFoundError(f"Missing config.yaml.")
     return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
@@ -92,6 +146,25 @@ class FeishuClient:
             data = resp.json()
         if data.get("code") != 0:
             raise RuntimeError(f"send card failed: {data}")
+        return data
+
+    def send_text(self, chat_id: str, text: str) -> Dict[str, Any]:
+        token = self.tenant_access_token()
+        url = f"{self.base_url}/open-apis/im/v1/messages?receive_id_type=chat_id"
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
+            "receive_id": chat_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": text}, ensure_ascii=False),
+        }
+        with httpx.Client(timeout=20) as client:
+            resp = client.post(url, headers=headers, json=payload)
+            if resp.status_code >= 400:
+                logger.error("Feishu send_text http_error status=%s body=%s", resp.status_code, resp.text[:3000])
+            resp.raise_for_status()
+            data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"send text failed: {data}")
         return data
 
     def update_card(self, message_id: str, card: Dict[str, Any]) -> Dict[str, Any]:
@@ -144,184 +217,295 @@ class GitLabClient:
             data = resp.json()
         return data
 
+    def get_pipeline(self, project_id: int, pipeline_id: int) -> Dict[str, Any]:
+        url = f"{self.base_url}/api/v4/projects/{project_id}/pipelines/{pipeline_id}"
+        headers = {"PRIVATE-TOKEN": self.token}
+        with httpx.Client(timeout=30) as client:
+            resp = client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            return {}
+
+    def get_pipeline_jobs(self, project_id: int, pipeline_id: int) -> list:
+        url = f"{self.base_url}/api/v4/projects/{project_id}/pipelines/{pipeline_id}/jobs"
+        headers = {"PRIVATE-TOKEN": self.token}
+        with httpx.Client(timeout=30) as client:
+            resp = client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            return []
+
+    def get_branches(self, project_id: int) -> list:
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/branches"
+        headers = {"PRIVATE-TOKEN": self.token}
+        with httpx.Client(timeout=20) as client:
+            resp = client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return [b["name"] for b in resp.json()][:20]
+            return ["main"]
+
     def latest_pipeline(self, project_id: int, ref: Optional[str] = None) -> Optional[Dict[str, Any]]:
         pipelines = self.list_pipelines(project_id=project_id, ref=ref, per_page=1)
         if isinstance(pipelines, list) and pipelines:
             return pipelines[0]
         return None
 
-
 def normalize_selection(
     cfg: Dict[str, Any],
+    gitlab_client: Optional[GitLabClient] = None,
     selected_project: Optional[str] = None,
+    selected_repo: Optional[str] = None,
     selected_branch: Optional[str] = None,
     selected_env: Optional[str] = None,
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     projects = cfg.get("projects", [])
     if not projects:
-        projects = [{"name": "demo", "repo": "demo", "branches": ["main"], "environments": ["test"]}]
+        projects = [{"name": "demo", "environments": ["test"], "repos": [{"name": "demo", "repo": "demo", "id": 1}]}]
 
     project = next((p for p in projects if p["name"] == selected_project), None) or projects[0]
-    branch_value = selected_branch or project["branches"][0]
-    env_value = selected_env or project["environments"][0]
+    
+    repos = project.get("repos", [])
+    if not repos:
+        repos = [{"name": "demo", "repo": "demo", "id": 1}]
+        
+    repo = next((r for r in repos if r["name"] == selected_repo), None) or repos[0]
 
-    if branch_value not in project["branches"]:
-        branch_value = project["branches"][0]
+    env_value = selected_env or project["environments"][0]
     if env_value not in project["environments"]:
         env_value = project["environments"][0]
 
+    branches = ["main"]
+    if gitlab_client:
+        try:
+            branches = gitlab_client.get_branches(repo["id"])
+        except Exception as e:
+            logger.error(f"failed to fetch branches: {e}")
+            
+    if not branches:
+        branches = ["main"]
+
+    branch_value = selected_branch if selected_branch in branches else branches[0]
+
     return {
         "project": project["name"],
+        "repo": repo["name"],
+        "repo_id": repo["id"],
+        "repo_path": repo["repo"],
         "branch": branch_value,
         "env": env_value,
+        "branches": branches,
     }
 
 
 def build_card(
     cfg: Dict[str, Any],
     status: str,
-    current_ref: str,
-    selected_project: Optional[str] = None,
-    selected_branch: Optional[str] = None,
-    selected_env: Optional[str] = None,
+    state: Dict[str, Any],
     latest_pipeline_text: Optional[str] = None,
     latest_result_text: Optional[str] = None,
     show_details: bool = False,
 ) -> Dict[str, Any]:
     projects = cfg.get("projects", [])
-    if not projects:
-        projects = [{"name": "demo", "repo": "demo", "branches": ["main"], "environments": ["test"]}]
+    project = next((p for p in projects if p["name"] == state["project"]), projects[0])
 
-    state = normalize_selection(cfg, selected_project, selected_branch, selected_env)
-    project = next((p for p in projects if p["name"] == state["project"]), None) or projects[0]
     latest_result_text = latest_result_text or status
     latest_pipeline_text = latest_pipeline_text or "暂无"
 
-    display_project_name = project.get("display_name") or project.get("title") or project["name"]
-    repo_name = project.get("repo", "-")
+    display_project_name = project["name"]
+    repo_name = state["repo"]
 
     meta = status_meta(status, latest_result_text, latest_pipeline_text)
 
     project_options = [
-        {
-            "text": {
-                "tag": "plain_text",
-                "content": p.get("display_name") or p.get("title") or p["name"],
-            },
-            "value": p["name"],
-        }
+        {"text": {"tag": "plain_text", "content": p["name"]},"value": p["name"]}
         for p in projects
     ]
     repo_options = [
-        {
-            "text": {"tag": "plain_text", "content": p.get("repo", p["name"])},
-            "value": p["name"],
-        }
-        for p in projects
+        {"text": {"tag": "plain_text", "content": r["name"]},"value": r["name"]}
+        for r in project["repos"]
     ]
     branch_options = [
-        {"text": {"tag": "plain_text", "content": b}, "value": b}
-        for b in project["branches"]
+        {"text": {"tag": "plain_text", "content": b},"value": b}
+        for b in state["branches"]
     ]
-    env_options = [
-        {"text": {"tag": "plain_text", "content": e}, "value": e}
+    
+    def get_env_display(e: str) -> str:
+        le = e.lower()
+        if le in ["test", "测试"]:
+            return f"{e}环境 (Test)"
+        if le in ["prod", "production", "线上", "生产"]:
+            return f"{e}环境 (Prod)"
+        return f"{e}环境"
+
+    env_options_enriched = [
+        {"text": {"tag": "plain_text", "content": get_env_display(e)}, "value": e}
         for e in project["environments"]
     ]
+    env_placeholder = get_env_display(state["env"])
 
     status_color = "green"
-    status_label = "空闲中"
+    status_label = "空闲中 (Idle)"
     if meta["label"] == "处理中":
         status_color = "orange"
-        status_label = "处理中"
+        status_label = "处理中 (Running)"
     elif meta["label"] == "异常":
         status_color = "red"
-        status_label = "异常"
+        status_label = "异常 (Failed)"
 
     pipeline_line = latest_pipeline_text if latest_pipeline_text and latest_pipeline_text != "暂无" else "暂无"
 
     helper_line = None
     if show_details and latest_result_text:
         helper_line = latest_result_text
+        
+    action_base_val = {
+        "project": state["project"],
+        "repo": state["repo"],
+        "branch": state["branch"],
+        "env": state["env"]
+    }
 
     elements = [
         {
-            "tag": "div",
-            "text": {
-                "tag": "plain_text",
-                "content": f"当前流水线状态：● {status_label}",
-            },
-        },
-        {
-            "tag": "div",
-            "text": {
-                "tag": "plain_text",
-                "content": f"流水线链接：{pipeline_line}",
-            },
+            "tag": "markdown",
+            "content": f"当前流水线状态： {meta['emoji']} {status_label}\n流水线链接：{pipeline_line}"
         },
         {"tag": "hr"},
         {
-            "tag": "div",
-            "text": {"tag": "plain_text", "content": "选项目 (Project)"},
-        },
-        {
-            "tag": "action",
-            "actions": [
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "columns": [
                 {
-                    "tag": "select_static",
-                    "placeholder": {"tag": "plain_text", "content": display_project_name},
-                    "name": "project",
-                    "options": project_options,
-                    "value": {**state, "current_field": "project"},
-                }
-            ],
-        },
-        {
-            "tag": "div",
-            "text": {"tag": "plain_text", "content": "选仓库 (Repository)"},
-        },
-        {
-            "tag": "action",
-            "actions": [
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "vertical_align": "center",
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": "**🏢 选项目 (Project)**"
+                        }
+                    ]
+                },
                 {
-                    "tag": "select_static",
-                    "placeholder": {"tag": "plain_text", "content": repo_name},
-                    "name": "repo",
-                    "options": repo_options,
-                    "value": {**state, "current_field": "repo"},
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 2,
+                    "vertical_align": "center",
+                    "elements": [
+                        {
+                            "tag": "select_static",
+                            "placeholder": {"tag": "plain_text", "content": display_project_name},
+                            "name": "project",
+                            "options": project_options,
+                            "value": {**action_base_val, "current_field": "project"},
+                        }
+                    ]
                 }
-            ],
+            ]
         },
         {
-            "tag": "div",
-            "text": {"tag": "plain_text", "content": "选分支 / 标签 (Branch / Tag)"},
-        },
-        {
-            "tag": "action",
-            "actions": [
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "columns": [
                 {
-                    "tag": "select_static",
-                    "placeholder": {"tag": "plain_text", "content": state["branch"]},
-                    "name": "branch",
-                    "options": branch_options,
-                    "value": {**state, "current_field": "branch"},
-                }
-            ],
-        },
-        {
-            "tag": "div",
-            "text": {"tag": "plain_text", "content": "选环境 (Environment)"},
-        },
-        {
-            "tag": "action",
-            "actions": [
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "vertical_align": "center",
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": "**📦 选仓库 (Repository)**"
+                        }
+                    ]
+                },
                 {
-                    "tag": "select_static",
-                    "placeholder": {"tag": "plain_text", "content": state["env"]},
-                    "name": "env",
-                    "options": env_options,
-                    "value": {**state, "current_field": "env"},
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 2,
+                    "vertical_align": "center",
+                    "elements": [
+                        {
+                            "tag": "select_static",
+                            "placeholder": {"tag": "plain_text", "content": repo_name},
+                            "name": "repo",
+                            "options": repo_options,
+                            "value": {**action_base_val, "current_field": "repo"},
+                        }
+                    ]
                 }
-            ],
+            ]
+        },
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "vertical_align": "center",
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": "**✂️ 选分支 (Branch)**"
+                        }
+                    ]
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 2,
+                    "vertical_align": "center",
+                    "elements": [
+                        {
+                            "tag": "select_static",
+                            "placeholder": {"tag": "plain_text", "content": state["branch"]},
+                            "name": "branch",
+                            "options": branch_options,
+                            "value": {**action_base_val, "current_field": "branch"},
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "vertical_align": "center",
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": "**🚀 选环境 (Environment)**"
+                        }
+                    ]
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 2,
+                    "vertical_align": "center",
+                    "elements": [
+                        {
+                            "tag": "select_static",
+                            "placeholder": {"tag": "plain_text", "content": env_placeholder},
+                            "name": "env",
+                            "options": env_options_enriched,
+                            "value": {**action_base_val, "current_field": "env"},
+                        }
+                    ]
+                }
+            ]
         },
         {"tag": "hr"},
         {
@@ -329,14 +513,14 @@ def build_card(
             "actions": [
                 {
                     "tag": "button",
-                    "text": {"tag": "plain_text", "content": "申请发布"},
+                    "text": {"tag": "plain_text", "content": "✅ 执行触发 / 申请发布"},
                     "type": "primary",
-                    "value": {**state, "action": "run"},
+                    "value": {**action_base_val, "action": "run"},
                 },
                 {
                     "tag": "button",
-                    "text": {"tag": "plain_text", "content": "刷新状态"},
-                    "value": {**state, "action": "refresh"},
+                    "text": {"tag": "plain_text", "content": "🔄 刷新当前状态"},
+                    "value": {**action_base_val, "action": "refresh"},
                 },
             ],
         },
@@ -357,7 +541,7 @@ def build_card(
 
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "GitLab 智能发版控制台"}},
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "🚀 GitLab 智能发版控制台"}},
         "elements": elements,
     }
 
@@ -433,13 +617,25 @@ async def feishu_event(request: Request):
     text = msg["text"].strip().lower()
     chat_id = msg["chat_id"]
     logger.info("Received text callback chat_id=%s text=%s", chat_id, text)
-    if text != "gitlab":
+    
+    matched_project = None
+    for p in cfg.get("projects", []):
+        proj_name = p["name"]
+        trigger_word = f"{proj_name}发版".lower()
+        if trigger_word in text or text == "gitlab":
+            matched_project = proj_name
+            break
+            
+    if not matched_project:
         return JSONResponse({"code": 0, "msg": "ignored"})
 
+    gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
+    state = normalize_selection(cfg, gitlab_client=gitlab, selected_project=matched_project)
+    
     card = build_card(
         cfg,
+        state=state,
         status="就绪",
-        current_ref="main",
         latest_result_text="就绪",
         latest_pipeline_text="暂无",
         show_details=False,
@@ -488,6 +684,10 @@ async def feishu_card(request: Request):
     cfg = load_config()
     context = event.get("context", {}) or {}
     open_message_id = context.get("open_message_id") or ""
+    open_chat_id = context.get("open_chat_id") or context.get("chat_id") or ""
+    operator = event.get("operator", {}) or {}
+    operator_open_id = operator.get("open_id") or ""
+
     stored_state = CARD_STATE.get(open_message_id, {}) if open_message_id else {}
 
     action_name = None
@@ -507,21 +707,44 @@ async def feishu_card(request: Request):
     current_field = raw_value.get("current_field") if isinstance(raw_value, dict) else None
     option = action.get("option") if isinstance(action.get("option"), str) else None
 
-    if action.get("tag") == "select_static":
-        selected_project = stored_state.get("project")
-        selected_branch = stored_state.get("branch")
+    # Handle dropdown cascades:
+    # If the user selected a new project, we should reset the repo to the first one available
+    if current_field == "project" and option:
+        projects = cfg.get("projects", [])
+        project = next((p for p in projects if p["name"] == option), None)
+        if project and project.get("repos"):
+            pick_repo = project["repos"][0]["name"]
+        else:
+            pick_repo = None
+        selected_project = option
+        selected_repo = pick_repo
+        selected_branch = None # reset branch
         selected_env = stored_state.get("env")
+    elif action.get("tag") == "select_static":
+        selected_project = stored_state.get("project") or pick_value("project")
+        selected_repo = stored_state.get("repo") or pick_value("repo")
+        selected_branch = stored_state.get("branch") or pick_value("branch")
+        selected_env = stored_state.get("env") or pick_value("env")
+        if current_field == "repo" and option:
+            selected_repo = option
+            selected_branch = None # reset branch whenever repo changes
+        elif current_field == "branch" and option:
+            selected_branch = option
+        elif current_field == "env" and option:
+            selected_env = option
     elif action_name in {"run", "refresh"} and stored_state:
         selected_project = stored_state.get("project")
+        selected_repo = stored_state.get("repo")
         selected_branch = stored_state.get("branch")
         selected_env = stored_state.get("env")
     else:
         selected_project = pick_value("project") or stored_state.get("project")
+        selected_repo = pick_value("repo") or stored_state.get("repo")
         selected_branch = pick_value("branch") or stored_state.get("branch")
         selected_env = pick_value("env") or stored_state.get("env")
 
     logger.info(
-        "card action parsed open_message_id=%s action_name=%s current_field=%s option=%s action_tag=%s stored_state=%s selected_project=%s selected_branch=%s selected_env=%s",
+        "card action parsed open_message_id=%s action_name=%s current_field=%s option=%s action_tag=%s stored_state=%s selected_project=%s selected_repo=%s selected_branch=%s selected_env=%s",
         open_message_id,
         action_name,
         current_field,
@@ -529,38 +752,21 @@ async def feishu_card(request: Request):
         action.get("tag"),
         stored_state,
         selected_project,
+        selected_repo,
         selected_branch,
         selected_env,
     )
 
-    merged_project = selected_project
-    merged_branch = selected_branch
-    merged_env = selected_env
-    if current_field == "project" and option:
-        merged_project = option
-    elif current_field == "repo" and option:
-        merged_project = option
-    elif current_field == "branch" and option:
-        merged_branch = option
-    elif current_field == "env" and option:
-        merged_env = option
-
-    logger.info(
-        "card action merge before normalize open_message_id=%s merged_project=%s merged_branch=%s merged_env=%s",
-        open_message_id,
-        merged_project,
-        merged_branch,
-        merged_env,
-    )
-
-    state = normalize_selection(cfg, merged_project, merged_branch, merged_env)
+    gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
+    state = normalize_selection(cfg, gitlab, selected_project, selected_repo, selected_branch, selected_env)
+    
     if open_message_id:
         CARD_STATE[open_message_id] = dict(state)
     logger.info("card action merged state=%s", state)
 
     dedup_key = ""
     if action_name in {"run", "refresh"}:
-        dedup_key = f"{open_message_id}:{action_name}:{state['project']}:{state['branch']}:{state['env']}"
+        dedup_key = f"{open_message_id}:{action_name}:{state['project']}:{state['repo']}:{state['branch']}:{state['env']}"
         now_ts = time.time()
         cleanup_action_dedup(now_ts)
         last_ts = ACTION_DEDUP.get(dedup_key, 0)
@@ -571,25 +777,22 @@ async def feishu_card(request: Request):
         ACTION_DEDUP[dedup_key] = now_ts
 
     status = "就绪"
-    current_ref = state["branch"]
     latest_pipeline_text = "暂无"
     latest_result_text = "就绪"
-
-    project = next((p for p in cfg.get("projects", []) if p["name"] == state["project"]), None) or cfg["projects"][0]
-    gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
+    
+    pipeline_id = None
 
     if action_name == "run":
         try:
             status = "执行中"
             pipeline = gitlab.trigger_pipeline(
-                project_id=project["id"],
+                project_id=state["repo_id"],
                 ref=state["branch"],
                 variables={"ENV": state["env"]},
             )
             pipeline_id = pipeline.get("id")
             pipeline_status = pipeline.get("status") or "created"
             latest_result_text = f"已触发 Pipeline #{pipeline_id}"
-            current_ref = pipeline.get("ref") or state["branch"]
             latest_pipeline_text = f"#{pipeline_id} / {pipeline_status}"
         except Exception as e:
             logger.exception("trigger pipeline failed")
@@ -598,11 +801,10 @@ async def feishu_card(request: Request):
     elif action_name == "refresh":
         try:
             status = "刷新中"
-            latest = gitlab.latest_pipeline(project_id=project["id"], ref=state["branch"])
+            latest = gitlab.latest_pipeline(project_id=state["repo_id"], ref=state["branch"])
             if latest:
                 pipeline_id = latest.get("id")
                 pipeline_status = latest.get("status")
-                current_ref = latest.get("ref") or state["branch"]
                 latest_pipeline_text = f"#{pipeline_id} / {pipeline_status}"
                 latest_result_text = f"最近 Pipeline #{pipeline_id} 状态: {pipeline_status}"
                 if str(pipeline_status).lower() == "success":
@@ -622,14 +824,11 @@ async def feishu_card(request: Request):
 
     card = build_card(
         cfg,
+        state=state,
         status=status,
-        current_ref=current_ref,
-        selected_project=state["project"],
-        selected_branch=state["branch"],
-        selected_env=state["env"],
         latest_pipeline_text=latest_pipeline_text,
         latest_result_text=latest_result_text,
-        show_details=(action_name in {"run", "refresh"}),
+        show_details=(action_name in {"run", "refresh"} or action.get("tag") == "select_static"),
     )
 
     feishu_client = FeishuClient(
@@ -637,25 +836,24 @@ async def feishu_card(request: Request):
         app_secret=cfg["feishu"]["app_secret"],
     )
     updated_in_place = False
-    if open_message_id and action_name in {"run", "refresh"}:
+    if open_message_id and (action_name in {"run", "refresh"} or action.get("tag") == "select_static"):
         try:
-            asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, 1.0))
+            delay = 1.0 if action_name in {"run", "refresh"} else 0.1
+            asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, delay))
             updated_in_place = True
             logger.info("scheduled delayed update open_message_id=%s", open_message_id)
+            
+            if action_name == "run" and pipeline_id:
+                asyncio.create_task(poll_pipeline_status(feishu_client, gitlab, cfg, state["repo_id"], pipeline_id, open_message_id, state, operator_open_id, open_chat_id))
+                logger.info("spawned background pipeline poller for pipeline_id=%s", pipeline_id)
+                
         except Exception:
             logger.exception("schedule delayed update failed open_message_id=%s", open_message_id)
-
-    open_chat_id = context.get("open_chat_id") or context.get("chat_id") or ""
-    if (not updated_in_place) and open_chat_id and action_name in {"run", "refresh"}:
-        try:
-            feishu_client.reply_card(open_chat_id, card)
-            logger.info("fallback sent new card to open_chat_id=%s", open_chat_id)
-        except Exception:
-            logger.exception("fallback send updated card failed open_chat_id=%s", open_chat_id)
 
     if updated_in_place:
         response_body = {}
     else:
+        # If there's no open_message_id, return empty. we already handle callback correctly
         response_body = {}
     logger.info("/feishu/card response=%s", json.dumps(response_body, ensure_ascii=False)[:3000])
     return JSONResponse(response_body)

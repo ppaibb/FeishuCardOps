@@ -14,9 +14,18 @@ gitlab:
   access_token: "glpat-JQ2tGwB7WCXJdBFW39Ses286MQp1OjMH.01.0w0o8yq5l"
 
 projects:
-  - id: 9
-    name: "gitlabci-configs"
-    display_name: "运维项目"
-    repo: "devops/gitlabci-configs"
-    branches: ["main", "test"]
+  - name: "运维项目"
     environments: ["test", "prod"]
+    repos:
+      - name: "gitlabci-configs"
+        repo: "devops/gitlabci-configs"
+        id: 9
+  - name: "全飞云演示项目"
+    environments: ["test", "prod"]
+    repos:
+      - name: "前端仓库"
+        repo: "qfy_workgroup/qfy-ui"
+        id: 11
+      - name: "后端仓库"
+        repo: "qfy_workgroup/qfy-cloud"
+        id: 10
