@@ -238,44 +238,31 @@ def build_card(
     elif meta["label"] == "异常":
         status_color = "red"
 
-    summary_lines = [f"**操作结果**：{rendered_result_text}"]
+    summary_lines = [f"**操作结果**：{rendered_result_text}", f"**流水线**：{latest_pipeline_text}"]
     if show_details:
-        summary_lines.append(f"**流水线**：{latest_pipeline_text}")
         summary_lines.append(f"**项目 / 仓库**：{display_project_name} / {repo_name}")
         summary_lines.append(f"**分支 / 环境**：{state['branch']} / {state['env']}")
         if current_ref:
             summary_lines.append(f"**Ref**：{current_ref}")
-    else:
-        summary_lines.append(f"**流水线**：{latest_pipeline_text}")
 
     elements = [
         {
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": f"**GitLab 发布面板**    <font color='grey'>|</font>    <font color='{status_color}'>●</font> **{meta['label']}**    <font color='grey'>|</font>    {latest_pipeline_text}",
+                "content": f"**GitLab 发布面板**    <font color='grey'>|</font>    <font color='{status_color}'>●</font> **{meta['label']}**",
             },
         },
         {
-            "tag": "column_set",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [
-                        {"tag": "div", "text": {"tag": "lark_md", "content": "**项目**"}},
-                    ],
-                },
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [
-                        {"tag": "div", "text": {"tag": "lark_md", "content": "**仓库**"}},
-                    ],
-                },
-            ],
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"<font color='grey'>{latest_pipeline_text}</font>",
+            },
+        },
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**项目**"},
         },
         {
             "tag": "action",
@@ -286,36 +273,28 @@ def build_card(
                     "name": "project",
                     "options": project_options,
                     "value": {**state, "current_field": "project"},
-                },
+                }
+            ],
+        },
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**仓库**"},
+        },
+        {
+            "tag": "action",
+            "actions": [
                 {
                     "tag": "select_static",
                     "placeholder": {"tag": "plain_text", "content": repo_name},
                     "name": "repo",
                     "options": repo_options,
                     "value": {**state, "current_field": "repo"},
-                },
+                }
             ],
         },
         {
-            "tag": "column_set",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [
-                        {"tag": "div", "text": {"tag": "lark_md", "content": "**分支**"}},
-                    ],
-                },
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [
-                        {"tag": "div", "text": {"tag": "lark_md", "content": "**环境**"}},
-                    ],
-                },
-            ],
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**分支**"},
         },
         {
             "tag": "action",
@@ -326,14 +305,23 @@ def build_card(
                     "name": "branch",
                     "options": branch_options,
                     "value": {**state, "current_field": "branch"},
-                },
+                }
+            ],
+        },
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "**环境**"},
+        },
+        {
+            "tag": "action",
+            "actions": [
                 {
                     "tag": "select_static",
                     "placeholder": {"tag": "plain_text", "content": state["env"]},
                     "name": "env",
                     "options": env_options,
                     "value": {**state, "current_field": "env"},
-                },
+                }
             ],
         },
         {
