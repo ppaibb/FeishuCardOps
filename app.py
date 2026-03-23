@@ -201,8 +201,6 @@ def build_card(
     repo_name = project.get("repo", "-")
 
     meta = status_meta(status, latest_result_text, latest_pipeline_text)
-    rendered_status = meta["label"]
-    rendered_result_text = latest_result_text
 
     project_options = [
         {
@@ -230,8 +228,6 @@ def build_card(
         for e in project["environments"]
     ]
 
-    status_emoji = meta["emoji"]
-
     status_color = "green"
     status_label = "空闲中"
     if meta["label"] == "处理中":
@@ -242,27 +238,30 @@ def build_card(
         status_label = "异常"
 
     pipeline_line = latest_pipeline_text if latest_pipeline_text and latest_pipeline_text != "暂无" else "暂无"
-    action_result_line = rendered_result_text if show_details else "请选择参数后执行，或刷新当前状态"
+
+    helper_line = None
+    if show_details and latest_result_text:
+        helper_line = latest_result_text
 
     elements = [
         {
             "tag": "div",
             "text": {
-                "tag": "lark_md",
-                "content": f"**当前流水线状态：** <font color='{status_color}'>● {status_label}</font>",
+                "tag": "plain_text",
+                "content": f"当前流水线状态：● {status_label}",
             },
         },
         {
             "tag": "div",
             "text": {
-                "tag": "lark_md",
-                "content": f"**流水线链接：** {pipeline_line}",
+                "tag": "plain_text",
+                "content": f"流水线链接：{pipeline_line}",
             },
         },
         {"tag": "hr"},
         {
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "选项目 (Project)"},
+            "text": {"tag": "plain_text", "content": "选项目 (Project)"},
         },
         {
             "tag": "action",
@@ -278,7 +277,7 @@ def build_card(
         },
         {
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "选仓库 (Repository)"},
+            "text": {"tag": "plain_text", "content": "选仓库 (Repository)"},
         },
         {
             "tag": "action",
@@ -294,7 +293,7 @@ def build_card(
         },
         {
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "选分支 / 标签 (Branch / Tag)"},
+            "text": {"tag": "plain_text", "content": "选分支 / 标签 (Branch / Tag)"},
         },
         {
             "tag": "action",
@@ -310,7 +309,7 @@ def build_card(
         },
         {
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "选环境 (Environment)"},
+            "text": {"tag": "plain_text", "content": "选环境 (Environment)"},
         },
         {
             "tag": "action",
@@ -336,21 +335,25 @@ def build_card(
                 },
                 {
                     "tag": "button",
-                    "text": {"tag": "plain_text", "content": "刷新当前状态"},
+                    "text": {"tag": "plain_text", "content": "刷新状态"},
                     "value": {**state, "action": "refresh"},
                 },
             ],
         },
-        {
-            "tag": "note",
-            "elements": [
-                {
-                    "tag": "lark_md",
-                    "content": f"<font color='grey'>最近结果：{action_result_line}</font>",
-                }
-            ],
-        },
     ]
+
+    if helper_line:
+        elements.append(
+            {
+                "tag": "note",
+                "elements": [
+                    {
+                        "tag": "plain_text",
+                        "content": helper_line,
+                    }
+                ],
+            }
+        )
 
     return {
         "config": {"wide_screen_mode": True},
