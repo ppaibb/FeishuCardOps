@@ -238,42 +238,44 @@ def build_card(
     elif meta["label"] == "异常":
         status_color = "red"
 
-    compact_lines = [
-        f"**当前状态**：<font color='{status_color}'>{meta['label']}</font>",
-        f"**流水线摘要**：{latest_pipeline_text}",
-    ]
+    summary_lines = [f"**操作结果**：{rendered_result_text}"]
     if show_details:
-        compact_lines.extend(
-            [
-                f"**操作结果**：{rendered_result_text}",
-                f"**项目 / 仓库**：{display_project_name} / {repo_name}",
-                f"**分支 / 环境**：{state['branch']} / {state['env']}",
-            ]
-        )
+        summary_lines.append(f"**流水线**：{latest_pipeline_text}")
+        summary_lines.append(f"**项目 / 仓库**：{display_project_name} / {repo_name}")
+        summary_lines.append(f"**分支 / 环境**：{state['branch']} / {state['env']}")
         if current_ref:
-            compact_lines.append(f"**当前 Ref**：{current_ref}")
+            summary_lines.append(f"**Ref**：{current_ref}")
     else:
-        compact_lines.append("**操作结果**：请选择参数后执行，或点击刷新查看最新流水线状态")
+        summary_lines.append(f"**流水线**：{latest_pipeline_text}")
 
     elements = [
         {
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": f"**GitLab 发布面板**\n<font color='grey'>简洁模式 / 当前项目可直接触发或刷新状态</font>",
+                "content": f"**GitLab 发布面板**    <font color='grey'>|</font>    <font color='{status_color}'>●</font> **{meta['label']}**    <font color='grey'>|</font>    {latest_pipeline_text}",
             },
         },
         {
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": f"<font color='{status_color}'>●</font> **{meta['label']}**    <font color='grey'>|</font>    **{latest_pipeline_text}**",
-            },
-        },
-        {"tag": "hr"},
-        {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": "**项目 (Project)**"},
+            "tag": "column_set",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        {"tag": "div", "text": {"tag": "lark_md", "content": "**项目**"}},
+                    ],
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        {"tag": "div", "text": {"tag": "lark_md", "content": "**仓库**"}},
+                    ],
+                },
+            ],
         },
         {
             "tag": "action",
@@ -284,28 +286,36 @@ def build_card(
                     "name": "project",
                     "options": project_options,
                     "value": {**state, "current_field": "project"},
-                }
-            ],
-        },
-        {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": "**仓库 (Repository)**"},
-        },
-        {
-            "tag": "action",
-            "actions": [
+                },
                 {
                     "tag": "select_static",
                     "placeholder": {"tag": "plain_text", "content": repo_name},
                     "name": "repo",
                     "options": repo_options,
                     "value": {**state, "current_field": "repo"},
-                }
+                },
             ],
         },
         {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": "**分支 (Branch / Tag)**"},
+            "tag": "column_set",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        {"tag": "div", "text": {"tag": "lark_md", "content": "**分支**"}},
+                    ],
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        {"tag": "div", "text": {"tag": "lark_md", "content": "**环境**"}},
+                    ],
+                },
+            ],
         },
         {
             "tag": "action",
@@ -316,26 +326,16 @@ def build_card(
                     "name": "branch",
                     "options": branch_options,
                     "value": {**state, "current_field": "branch"},
-                }
-            ],
-        },
-        {
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": "**环境 (Environment)**"},
-        },
-        {
-            "tag": "action",
-            "actions": [
+                },
                 {
                     "tag": "select_static",
                     "placeholder": {"tag": "plain_text", "content": state["env"]},
                     "name": "env",
                     "options": env_options,
                     "value": {**state, "current_field": "env"},
-                }
+                },
             ],
         },
-        {"tag": "hr"},
         {
             "tag": "action",
             "actions": [
@@ -352,13 +352,14 @@ def build_card(
                 },
             ],
         },
-        {"tag": "hr"},
         {
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": "\n".join(compact_lines),
-            },
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "lark_md",
+                    "content": "<font color='grey'>" + "    <font color='grey'>|</font>    ".join(summary_lines) + "</font>",
+                }
+            ],
         },
     ]
 
