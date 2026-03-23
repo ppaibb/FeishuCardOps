@@ -233,36 +233,36 @@ def build_card(
     status_emoji = meta["emoji"]
 
     status_color = "green"
+    status_label = "空闲中"
     if meta["label"] == "处理中":
         status_color = "orange"
+        status_label = "处理中"
     elif meta["label"] == "异常":
         status_color = "red"
+        status_label = "异常"
 
-    summary_lines = [f"**操作结果**：{rendered_result_text}", f"**流水线**：{latest_pipeline_text}"]
-    if show_details:
-        summary_lines.append(f"**项目 / 仓库**：{display_project_name} / {repo_name}")
-        summary_lines.append(f"**分支 / 环境**：{state['branch']} / {state['env']}")
-        if current_ref:
-            summary_lines.append(f"**Ref**：{current_ref}")
+    pipeline_line = latest_pipeline_text if latest_pipeline_text and latest_pipeline_text != "暂无" else "暂无"
+    action_result_line = rendered_result_text if show_details else "请选择参数后执行，或刷新当前状态"
 
     elements = [
         {
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": f"**GitLab 发布面板**    <font color='grey'>|</font>    <font color='{status_color}'>●</font> **{meta['label']}**",
+                "content": f"**当前流水线状态：** <font color='{status_color}'>● {status_label}</font>",
             },
         },
         {
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": f"<font color='grey'>{latest_pipeline_text}</font>",
+                "content": f"**流水线链接：** {pipeline_line}",
             },
         },
+        {"tag": "hr"},
         {
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "**项目**"},
+            "text": {"tag": "lark_md", "content": "选项目 (Project)"},
         },
         {
             "tag": "action",
@@ -278,7 +278,7 @@ def build_card(
         },
         {
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "**仓库**"},
+            "text": {"tag": "lark_md", "content": "选仓库 (Repository)"},
         },
         {
             "tag": "action",
@@ -294,7 +294,7 @@ def build_card(
         },
         {
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "**分支**"},
+            "text": {"tag": "lark_md", "content": "选分支 / 标签 (Branch / Tag)"},
         },
         {
             "tag": "action",
@@ -310,7 +310,7 @@ def build_card(
         },
         {
             "tag": "div",
-            "text": {"tag": "lark_md", "content": "**环境**"},
+            "text": {"tag": "lark_md", "content": "选环境 (Environment)"},
         },
         {
             "tag": "action",
@@ -324,18 +324,19 @@ def build_card(
                 }
             ],
         },
+        {"tag": "hr"},
         {
             "tag": "action",
             "actions": [
                 {
                     "tag": "button",
-                    "text": {"tag": "plain_text", "content": "执行触发"},
+                    "text": {"tag": "plain_text", "content": "申请发布"},
                     "type": "primary",
                     "value": {**state, "action": "run"},
                 },
                 {
                     "tag": "button",
-                    "text": {"tag": "plain_text", "content": "刷新状态"},
+                    "text": {"tag": "plain_text", "content": "刷新当前状态"},
                     "value": {**state, "action": "refresh"},
                 },
             ],
@@ -345,7 +346,7 @@ def build_card(
             "elements": [
                 {
                     "tag": "lark_md",
-                    "content": "<font color='grey'>" + "    <font color='grey'>|</font>    ".join(summary_lines) + "</font>",
+                    "content": f"<font color='grey'>最近结果：{action_result_line}</font>",
                 }
             ],
         },
@@ -353,7 +354,7 @@ def build_card(
 
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "GitLab 发布面板"}},
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "GitLab 智能发版控制台"}},
         "elements": elements,
     }
 
