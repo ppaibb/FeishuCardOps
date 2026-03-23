@@ -1,0 +1,22 @@
+feishu:
+  app_id: "cli_a936a9e2a6215bd3"
+  app_secret: "J6wEYJa5JO9LvStQoLlhgd01Dhvwk1Ul"
+  verification_token: "gYpg5YW9AXVAue1WoGcUfbDKuTod32Gn"
+  encrypt_key: ""
+  allow_from: []
+
+server:
+  bind_host: "0.0.0.0"
+  bind_port: 18789
+
+gitlab:
+  base_url: "http://60.16.4.220:30080"
+  access_token: "glpat-JQ2tGwB7WCXJdBFW39Ses286MQp1OjMH.01.0w0o8yq5l"
+
+projects:
+  - id: 9
+    name: "gitlabci-configs"
+    display_name: "运维项目"
+    repo: "devops/gitlabci-configs"
+    branches: ["main", "test"]
+    environments: ["test", "prod"]
