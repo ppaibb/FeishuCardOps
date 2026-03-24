@@ -1,0 +1,13 @@
+.venv
+__pycache__
+*.pyc
+*.log
+*.md
+.git
+.gitignore
+*.bak*
+*_perfect.*
+*.service.example
+manage.sh
+bot.py
+bot.log

@@ -19,6 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger("feishu_gitlab_card_http")
 CARD_STATE: Dict[str, Dict[str, Any]] = {}
 ACTION_DEDUP: Dict[str, float] = {}
+REPO_LOCKS: Dict[int, bool] = {}
 RUN_DEDUP_SECONDS = 4.0
 REFRESH_DEDUP_SECONDS = 1.5
 
@@ -52,58 +53,94 @@ async def delayed_update_card(feishu_client: "FeishuClient", open_message_id: st
         logger.exception("delayed update current card failed open_message_id=%s", open_message_id)
 
 
-async def poll_pipeline_status(feishu_client, gitlab_client, cfg, project_id, pipeline_id, open_message_id, state, operator_open_id=None, open_chat_id=None):
-    for i in range(120):  # poll up to 10 minutes (120 * 5s)
+def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: int, p_status: str, active_job_name: str) -> Dict[str, Any]:
+    if p_status == "success":
+        color = "green"
+        emoji = "✅"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务已执行成功！** 🎉\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id}"
+    elif p_status in {"failed", "canceled"}:
+        color = "red"
+        emoji = "❌"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务执行异常终止！**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id} [{p_status}]"
+    else:
+        color = "blue"
+        emoji = "⏳"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务追踪中...**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id}\n**当前进展**：正在跟进 {active_job_name}"
+        
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": color, "title": {"tag": "plain_text", "content": f"{emoji} 发版进度指示器"}},
+        "elements": [{"tag": "markdown", "content": content}]
+    }
+
+async def poll_pipeline_status(feishu_client, gitlab_client, cfg, project_id, pipeline_id, sub_message_id, state, operator_open_id=None, open_chat_id=None, open_message_id=None):
+    for i in range(120):  # poll up to 10 minutes
         await asyncio.sleep(5)
         try:
             pipeline = gitlab_client.get_pipeline(project_id, pipeline_id)
-            if not pipeline:
-                continue
+            if not pipeline: continue
             
             p_status = pipeline.get("status", "created")
-            
             jobs = gitlab_client.get_pipeline_jobs(project_id, pipeline_id)
             active_jobs = [j for j in jobs if j.get("status") == "running"]
             if not active_jobs:
                 active_jobs = [j for j in jobs if j.get("status") == "pending"]
             active_job_name = active_jobs[0]["name"] if active_jobs else "阶段衔接中"
             
-            latest_pipeline_text = f"#{pipeline_id} / {p_status}"
-            helper_line = f"⏳ 流水线运行中 [持续追踪]：正在跟进 {active_job_name}..."
-
-            if p_status == "success":
-                status = "就绪"
-                helper_line = f"✅ Pipeline #{pipeline_id} 终于跑完啦！本次执行成功！🎉"
-            elif p_status in {"failed", "canceled"}:
-                status = "异常"
-                helper_line = f"❌ Pipeline #{pipeline_id} 执行终止: {p_status}"
-            else:
-                status = "处理中"
-                
-            card = build_card(
-                cfg,
-                status=status,
-                state=state,
-                latest_pipeline_text=latest_pipeline_text,
-                latest_result_text=helper_line,
-                show_details=True,
-            )
-            feishu_client.update_card(open_message_id, card)
+            sub_card = build_sub_card(state, operator_open_id or "", pipeline_id, p_status, active_job_name)
+            feishu_client.update_card(sub_message_id, sub_card)
             
             if p_status in {"success", "failed", "canceled"}:
-                try:
-                    if operator_open_id and open_chat_id:
-                        msg_text = ""
-                        if p_status == "success":
-                            msg_text = f"<at user_id=\"{operator_open_id}\"></at> 您触发的 {state['project']} - {state['repo']} ({state['branch']}) 发版任务已执行成功！✅"
-                        else:
-                            msg_text = f"<at user_id=\"{operator_open_id}\"></at> 您触发的 {state['project']} - {state['repo']} ({state['branch']}) 发版任务已终止 (状态: {p_status}) ❌"
-                        feishu_client.send_text(open_chat_id, msg_text)
-                except Exception as e:
-                    logger.error("send notify text error %s", e)
                 break
         except Exception as e:
             logger.error("poll pipeline error %s", e)
+            
+    repo_id = state.get("repo_id")
+    if repo_id:
+        REPO_LOCKS[repo_id] = False
+        
+    try:
+        unlocked_card = build_card(
+            cfg,
+            status="就绪",
+            state=state,
+            latest_pipeline_text="暂无",
+            latest_result_text="上一任务已结束，锁已释放",
+            show_details=True,
+        )
+        if open_message_id:
+            feishu_client.update_card(open_message_id, unlocked_card)
+    except Exception as e:
+        logger.error("failed to unlock master card %s", e)
+
+async def background_run_pipeline(feishu_client, gitlab_client, cfg, state, open_message_id, operator_open_id, open_chat_id):
+    try:
+        variables = {"ENV": state["env"], "DEPLOY_ENV": state["env"]}
+        if state.get("module"):
+            variables["TARGET_MODULE"] = state["module"]
+            
+        pipeline = gitlab_client.trigger_pipeline(
+            project_id=state["repo_id"],
+            ref=state["branch"],
+            variables=variables,
+        )
+        pipeline_id = pipeline.get("id")
+        
+        if open_chat_id:
+            initial_sub_card = build_sub_card(state, operator_open_id or "", pipeline_id, "created", "流水线初始化")
+            resp = feishu_client.send_card(open_chat_id, initial_sub_card)
+            sub_msg_id = resp.get("data", {}).get("message_id")
+            if sub_msg_id:
+                asyncio.create_task(poll_pipeline_status(feishu_client, gitlab_client, cfg, state["repo_id"], pipeline_id, sub_msg_id, state, operator_open_id, open_chat_id, open_message_id))
+    except Exception as e:
+        logger.error("background run failed %s", e)
+        REPO_LOCKS[state["repo_id"]] = False
+        if open_message_id:
+            card = build_card(cfg, status="异常", state=state, latest_pipeline_text="暂无", latest_result_text=f"触发失败: {e}", show_details=True)
+            try:
+                feishu_client.update_card(open_message_id, card)
+            except Exception:
+                pass
 
 
 def load_config() -> Dict[str, Any]:
@@ -238,7 +275,7 @@ class GitLabClient:
     def get_branches(self, project_id: int) -> list:
         url = f"{self.base_url}/api/v4/projects/{project_id}/repository/branches"
         headers = {"PRIVATE-TOKEN": self.token}
-        with httpx.Client(timeout=20) as client:
+        with httpx.Client(timeout=1.5) as client:
             resp = client.get(url, headers=headers)
             if resp.status_code == 200:
                 return [b["name"] for b in resp.json()][:20]
@@ -257,6 +294,8 @@ def normalize_selection(
     selected_repo: Optional[str] = None,
     selected_branch: Optional[str] = None,
     selected_env: Optional[str] = None,
+    cached_branches: Optional[list] = None,
+    selected_module: Optional[str] = None,
 ) -> Dict[str, Any]:
     projects = cfg.get("projects", [])
     if not projects:
@@ -274,17 +313,23 @@ def normalize_selection(
     if env_value not in project["environments"]:
         env_value = project["environments"][0]
 
-    branches = ["main"]
-    if gitlab_client:
+    branches = []
+    if cached_branches:
+        branches = cached_branches
+    elif gitlab_client:
         try:
             branches = gitlab_client.get_branches(repo["id"])
         except Exception as e:
             logger.error(f"failed to fetch branches: {e}")
+            branches = ["⚠️ 获取分支超时"]
             
     if not branches:
-        branches = ["main"]
+        branches = ["⚠️ 暂无分支"]
 
     branch_value = selected_branch if selected_branch in branches else branches[0]
+
+    modules = repo.get("modules", [])
+    module_value = selected_module if selected_module in modules else (modules[0] if modules else None)
 
     return {
         "project": project["name"],
@@ -294,6 +339,8 @@ def normalize_selection(
         "branch": branch_value,
         "env": env_value,
         "branches": branches,
+        "modules": modules,
+        "module": module_value,
     }
 
 
@@ -364,6 +411,8 @@ def build_card(
         "branch": state["branch"],
         "env": state["env"]
     }
+    if state.get("module"):
+        action_base_val["module"] = state["module"]
 
     elements = [
         {
@@ -506,25 +555,72 @@ def build_card(
                     ]
                 }
             ]
-        },
-        {"tag": "hr"},
-        {
-            "tag": "action",
-            "actions": [
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "✅ 执行触发 / 申请发布"},
-                    "type": "primary",
-                    "value": {**action_base_val, "action": "run"},
-                },
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "🔄 刷新当前状态"},
-                    "value": {**action_base_val, "action": "refresh"},
-                },
-            ],
-        },
+        }
     ]
+    
+    if state.get("modules"):
+        mod_options = [{"text": {"tag": "plain_text", "content": m}, "value": m} for m in state["modules"]]
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "columns": [
+                {
+                    "tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                    "elements": [{"tag": "markdown", "content": "**🧩 选微服务 (Module)**"}]
+                },
+                {
+                    "tag": "column", "width": "weighted", "weight": 2, "vertical_align": "center",
+                    "elements": [
+                        {
+                            "tag": "select_static",
+                            "placeholder": {"tag": "plain_text", "content": state["module"]},
+                            "name": "module",
+                            "options": mod_options,
+                            "value": {**action_base_val, "current_field": "module"},
+                        }
+                    ]
+                }
+            ]
+        })
+
+    elements.append({"tag": "hr"})
+
+    is_locked = REPO_LOCKS.get(state.get("repo_id", -1), False)
+    
+    if is_locked:
+        action_elements = [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔒 当前仓库发版中..."},
+                "type": "default",
+                "value": {**action_base_val, "action": "locked"},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔄 刷新当前状态"},
+                "value": {**action_base_val, "action": "refresh"},
+            },
+        ]
+    else:
+        action_elements = [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "✅ 执行触发 / 申请发布"},
+                "type": "primary",
+                "value": {**action_base_val, "action": "run"},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔄 刷新当前状态"},
+                "value": {**action_base_val, "action": "refresh"},
+            },
+        ]
+
+    elements.append({
+        "tag": "action",
+        "actions": action_elements,
+    })
 
     if helper_line:
         elements.append(
@@ -629,26 +725,27 @@ async def feishu_event(request: Request):
     if not matched_project:
         return JSONResponse({"code": 0, "msg": "ignored"})
 
-    gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
-    state = normalize_selection(cfg, gitlab_client=gitlab, selected_project=matched_project)
-    
-    card = build_card(
-        cfg,
-        state=state,
-        status="就绪",
-        latest_result_text="就绪",
-        latest_pipeline_text="暂无",
-        show_details=False,
-    )
-    feishu = FeishuClient(cfg["feishu"]["app_id"], cfg["feishu"]["app_secret"])
-    try:
-        result = feishu.send_card(chat_id, card)
-        logger.info("Card sent by HTTP callback chat_id=%s result=%s", chat_id, json.dumps(result, ensure_ascii=False)[:1000])
-        return JSONResponse({"code": 0, "msg": "ok"})
-    except Exception as e:
-        logger.exception("send card failed chat_id=%s err=%s", chat_id, e)
-        return JSONResponse({"code": 0, "msg": "send_card_failed"})
+    asyncio.create_task(background_send_new_card(cfg, matched_project, chat_id))
+    return JSONResponse({"code": 0, "msg": "ok"})
 
+async def background_send_new_card(cfg, matched_project, chat_id):
+    try:
+        gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
+        state = normalize_selection(cfg, gitlab_client=gitlab, selected_project=matched_project)
+        
+        card = build_card(
+            cfg,
+            state=state,
+            status="就绪",
+            latest_result_text="就绪",
+            latest_pipeline_text="暂无",
+            show_details=False,
+        )
+        feishu = FeishuClient(cfg["feishu"]["app_id"], cfg["feishu"]["app_secret"])
+        result = feishu.send_card(chat_id, card)
+        logger.info("Card sent by async background chat_id=%s result=%s", chat_id, json.dumps(result, ensure_ascii=False)[:1000])
+    except Exception as e:
+        logger.exception("async send card failed chat_id=%s err=%s", chat_id, e)
 
 @app.post("/feishu/card")
 async def feishu_card(request: Request):
@@ -720,45 +817,57 @@ async def feishu_card(request: Request):
         selected_repo = pick_repo
         selected_branch = None # reset branch
         selected_env = stored_state.get("env")
+        selected_module = None
     elif action.get("tag") == "select_static":
         selected_project = stored_state.get("project") or pick_value("project")
         selected_repo = stored_state.get("repo") or pick_value("repo")
         selected_branch = stored_state.get("branch") or pick_value("branch")
         selected_env = stored_state.get("env") or pick_value("env")
+        selected_module = stored_state.get("module") or pick_value("module")
         if current_field == "repo" and option:
             selected_repo = option
             selected_branch = None # reset branch whenever repo changes
+            selected_module = None
         elif current_field == "branch" and option:
             selected_branch = option
         elif current_field == "env" and option:
             selected_env = option
+        elif current_field == "module" and option:
+            selected_module = option
     elif action_name in {"run", "refresh"} and stored_state:
         selected_project = stored_state.get("project")
         selected_repo = stored_state.get("repo")
         selected_branch = stored_state.get("branch")
         selected_env = stored_state.get("env")
+        selected_module = stored_state.get("module")
     else:
         selected_project = pick_value("project") or stored_state.get("project")
         selected_repo = pick_value("repo") or stored_state.get("repo")
         selected_branch = pick_value("branch") or stored_state.get("branch")
         selected_env = pick_value("env") or stored_state.get("env")
+        selected_module = pick_value("module") or stored_state.get("module")
 
     logger.info(
-        "card action parsed open_message_id=%s action_name=%s current_field=%s option=%s action_tag=%s stored_state=%s selected_project=%s selected_repo=%s selected_branch=%s selected_env=%s",
+        "card action parsed open_message_id=%s action_name=%s current_field=%s option=%s stored_state=%s selected_project=%s selected_repo=%s selected_branch=%s selected_env=%s selected_module=%s",
         open_message_id,
         action_name,
         current_field,
         option,
-        action.get("tag"),
         stored_state,
         selected_project,
         selected_repo,
         selected_branch,
         selected_env,
+        selected_module,
     )
 
     gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
-    state = normalize_selection(cfg, gitlab, selected_project, selected_repo, selected_branch, selected_env)
+    
+    cached_branches = None
+    if stored_state.get("repo") == selected_repo and stored_state.get("branches"):
+        cached_branches = stored_state.get("branches")
+        
+    state = normalize_selection(cfg, gitlab, selected_project, selected_repo, selected_branch, selected_env, cached_branches, selected_module)
     
     if open_message_id:
         CARD_STATE[open_message_id] = dict(state)
@@ -782,22 +891,29 @@ async def feishu_card(request: Request):
     
     pipeline_id = None
 
+    if action_name == "locked":
+        return JSONResponse({"toast": {"type": "info", "content": "当前仓库正在发布排队中，请等待上一任务完成！"}})
+
     if action_name == "run":
-        try:
-            status = "执行中"
-            pipeline = gitlab.trigger_pipeline(
-                project_id=state["repo_id"],
-                ref=state["branch"],
-                variables={"ENV": state["env"]},
-            )
-            pipeline_id = pipeline.get("id")
-            pipeline_status = pipeline.get("status") or "created"
-            latest_result_text = f"已触发 Pipeline #{pipeline_id}"
-            latest_pipeline_text = f"#{pipeline_id} / {pipeline_status}"
-        except Exception as e:
-            logger.exception("trigger pipeline failed")
-            status = "异常"
-            latest_result_text = f"触发失败: {e}"
+        if "⚠️" in state["branch"]:
+            return JSONResponse({"toast": {"type": "error", "content": "远程分支读取失败，请重新切一次仓库刷出正常分支后再执行！"}})
+
+        if REPO_LOCKS.get(state["repo_id"]):
+            logger.warning("Repo %s is locked, run rejected.", state["repo_id"])
+            return JSONResponse({"toast": {"type": "error", "content": "该仓正在发布，请稍后"}})
+            
+        REPO_LOCKS[state["repo_id"]] = True
+        
+        feishu_client = FeishuClient(app_id=cfg["feishu"]["app_id"], app_secret=cfg["feishu"]["app_secret"])
+        asyncio.create_task(background_run_pipeline(feishu_client, gitlab, cfg, state, open_message_id, operator_open_id, open_chat_id))
+        
+        # Build immediate locked card for async UI mutating
+        card = build_card(cfg, status="执行中", state=state, latest_pipeline_text="初始化中...", latest_result_text="已接收发版指令正在投递...", show_details=True)
+        if open_message_id:
+            asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, 1.0))
+            
+        return JSONResponse({"toast": {"type": "info", "content": "已触发发版！进度指示卡马上发出..."}})
+
     elif action_name == "refresh":
         try:
             status = "刷新中"
@@ -835,25 +951,12 @@ async def feishu_card(request: Request):
         app_id=cfg["feishu"]["app_id"],
         app_secret=cfg["feishu"]["app_secret"],
     )
-    updated_in_place = False
-    if open_message_id and (action_name in {"run", "refresh"} or action.get("tag") == "select_static"):
-        try:
-            delay = 1.0 if action_name in {"run", "refresh"} else 0.1
-            asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, delay))
-            updated_in_place = True
-            logger.info("scheduled delayed update open_message_id=%s", open_message_id)
-            
-            if action_name == "run" and pipeline_id:
-                asyncio.create_task(poll_pipeline_status(feishu_client, gitlab, cfg, state["repo_id"], pipeline_id, open_message_id, state, operator_open_id, open_chat_id))
-                logger.info("spawned background pipeline poller for pipeline_id=%s", pipeline_id)
-                
-        except Exception:
-            logger.exception("schedule delayed update failed open_message_id=%s", open_message_id)
+    response_body = {}
+    if open_message_id and (action_name in {"refresh"} or action.get("tag") == "select_static"):
+        
+        # 极速 0.05s 无缝异步刷新，不发 Toast 避免与 PATCH 产生飞书客户端事件竞争
+        asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, 0.05))
+        response_body = {}
 
-    if updated_in_place:
-        response_body = {}
-    else:
-        # If there's no open_message_id, return empty. we already handle callback correctly
-        response_body = {}
     logger.info("/feishu/card response=%s", json.dumps(response_body, ensure_ascii=False)[:3000])
     return JSONResponse(response_body)
