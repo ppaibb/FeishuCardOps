@@ -11,11 +11,14 @@ RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua
 
 # 拷贝应用代码
 COPY app.py .
+COPY core/ core/
+COPY routes/ routes/
+COPY services/ services/
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import httpx; r = httpx.get('http://127.0.0.1:18789/healthz', timeout=3); assert r.status_code == 200"
+    CMD python -c "import httpx; r = httpx.get('http://127.0.0.1:55000/healthz', timeout=3); assert r.status_code == 200"
 
-EXPOSE 18789
+EXPOSE 55000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "18789", "--log-level", "info"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "55000", "--log-level", "info"]

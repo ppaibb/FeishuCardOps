@@ -1,0 +1,141 @@
+import asyncio
+import json
+import logging
+from typing import Any, Dict
+
+from core.card_builder import build_card, build_sub_card
+from core.feishu_client import FeishuClient
+from core.gitlab_client import GitLabClient
+from core.state import REPO_LOCKS
+from services.history import add_record, update_record_status
+
+logger = logging.getLogger("feishu_gitlab_card_http")
+
+
+async def delayed_update_card(feishu_client: FeishuClient, open_message_id: str, card: Dict[str, Any], delay_seconds: float = 1.0) -> None:
+    try:
+        await asyncio.sleep(delay_seconds)
+        result = await feishu_client.update_card(open_message_id, card)
+        logger.info("delayed updated current card open_message_id=%s result=%s", open_message_id, json.dumps(result, ensure_ascii=False)[:1000])
+    except Exception:
+        logger.exception("delayed update current card failed open_message_id=%s", open_message_id)
+
+
+async def poll_pipeline_status(
+    feishu_client: FeishuClient,
+    gitlab_client: GitLabClient,
+    cfg: Dict[str, Any],
+    project_id: int,
+    pipeline_id: int,
+    sub_message_id: str,
+    state: Dict[str, Any],
+    operator_open_id: str = "",
+    open_chat_id: str = "",
+    open_message_id: str = "",
+) -> None:
+    final_status = "unknown"
+    for i in range(120):  # poll up to 10 minutes
+        await asyncio.sleep(5)
+        try:
+            pipeline = await gitlab_client.get_pipeline(project_id, pipeline_id)
+            if not pipeline:
+                continue
+
+            p_status = pipeline.get("status", "created")
+            jobs = await gitlab_client.get_pipeline_jobs(project_id, pipeline_id)
+            
+            active_jobs = [j for j in jobs if j.get("status") == "running"]
+            if not active_jobs:
+                active_jobs = [j for j in jobs if j.get("status") == "pending"]
+            active_job_name = active_jobs[0]["name"] if active_jobs else "阶段衔接中"
+
+            failed_job_info = ""
+            if p_status == "failed":
+                failed_jobs = [j for j in jobs if j.get("status") == "failed"]
+                if failed_jobs:
+                    fj = failed_jobs[0]
+                    fj_name = fj.get("name", "unknown")
+                    fj_url = fj.get("web_url", "")
+                    failed_job_info = f"环节 **{fj_name}** 执行失败"
+                    if fj_url:
+                        failed_job_info += f"  —  [查看报错日志]({fj_url})"
+
+            sub_card = build_sub_card(state, operator_open_id, pipeline_id, p_status, active_job_name, failed_job_info)
+            await feishu_client.update_card(sub_message_id, sub_card)
+
+            if p_status in {"success", "failed", "canceled"}:
+                final_status = p_status
+                break
+        except Exception as e:
+            logger.error("poll pipeline error %s", e)
+
+    # 更新历史记录状态
+    repo_id = state.get("repo_id")
+    if repo_id:
+        update_record_status(repo_id, pipeline_id, final_status)
+        REPO_LOCKS[repo_id] = False
+
+    try:
+        unlocked_card = build_card(
+            cfg,
+            status="就绪",
+            state=state,
+            latest_pipeline_text="暂无",
+            latest_result_text="上一任务已结束，锁已释放",
+            show_details=True,
+        )
+        if open_message_id:
+            await feishu_client.update_card(open_message_id, unlocked_card)
+    except Exception as e:
+        logger.error("failed to unlock master card %s", e)
+
+
+async def background_run_pipeline(
+    feishu_client: FeishuClient,
+    gitlab_client: GitLabClient,
+    cfg: Dict[str, Any],
+    state: Dict[str, Any],
+    open_message_id: str,
+    operator_open_id: str,
+    open_chat_id: str,
+) -> None:
+    try:
+        variables = {"ENV": state["env"], "DEPLOY_ENV": state["env"]}
+        if state.get("module"):
+            variables["TARGET_MODULE"] = state["module"]
+
+        pipeline = await gitlab_client.trigger_pipeline(
+            project_id=state["repo_id"],
+            ref=state["branch"],
+            variables=variables,
+        )
+        pipeline_id = pipeline.get("id")
+
+        # 记录到历史
+        add_record(
+            repo_id=state["repo_id"],
+            pipeline_id=pipeline_id,
+            project_name=state["project"],
+            repo_name=state["repo"],
+            branch=state["branch"],
+            env=state["env"],
+            operator_open_id=operator_open_id,
+            module=state.get("module"),
+            status="running",
+        )
+
+        if open_chat_id:
+            initial_sub_card = build_sub_card(state, operator_open_id or "", pipeline_id, "created", "流水线初始化")
+            resp = await feishu_client.send_card(open_chat_id, initial_sub_card)
+            sub_msg_id = resp.get("data", {}).get("message_id")
+            if sub_msg_id:
+                asyncio.create_task(poll_pipeline_status(feishu_client, gitlab_client, cfg, state["repo_id"], pipeline_id, sub_msg_id, state, operator_open_id, open_chat_id, open_message_id))
+    except Exception as e:
+        logger.error("background run failed %s", e)
+        REPO_LOCKS[state["repo_id"]] = False
+        if open_message_id:
+            card = build_card(cfg, status="异常", state=state, latest_pipeline_text="暂无", latest_result_text=f"触发失败: {e}", show_details=True)
+            try:
+                await feishu_client.update_card(open_message_id, card)
+            except Exception:
+                pass

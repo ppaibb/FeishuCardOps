@@ -15,7 +15,7 @@ feishu:
 # ---- 服务监听 ----
 server:
   bind_host: "0.0.0.0"
-  bind_port: 18789
+  bind_port: 55000
 
 # ---- GitLab 配置 ----
 gitlab:
@@ -45,3 +45,33 @@ projects:
       - name: "主仓库"
         repo: "group/main-repo"
         id: 3
+
+# ---- 权限控制 ----
+# 基于飞书用户 open_id 的发版权限管理
+# 不配置此节则所有用户均可操作（向后兼容）
+permissions:
+  default_policy: "allow"                      # 全局默认策略：allow (允许) / deny (拒绝)
+
+  # 权限规则列表（从后往前匹配，最后一条匹配的规则优先）
+  rules:
+    # 所有人都可以在 test 环境发版
+    - project: "*"                             # 匹配所有项目，也可指定项目名如 "示例项目A"
+      env: "test"                              # 匹配环境名
+      policy: "allow"                          # 该规则的策略
+
+    # 生产环境仅允许白名单用户
+    - project: "*"
+      env: "prod"
+      policy: "deny"                           # 默认拒绝
+      allow_users:                             # 白名单用户（飞书 open_id）
+        - "ou_xxxxxxxxxxxxxxxx"                # 运维负责人
+        - "ou_yyyyyyyyyyyyyyyy"                # 技术经理
+
+  # 审批流配置（可选）
+  # 匹配的场景下，即使有权限也需要审批人批准后才能触发
+  approval_required:
+    - project: "*"
+      env: "prod"
+      approvers:                               # 审批人列表（飞书 open_id）
+        - "ou_approver1xxxxxxxxxxxx"           # 审批人1
+        - "ou_approver2xxxxxxxxxxxx"           # 审批人2

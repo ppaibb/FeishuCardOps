@@ -6,14 +6,14 @@ services:
     container_name: feishu-gitlab-bot
     restart: always
     ports:
-      - "18789:18789"
+      - "55000:55000"
     volumes:
       # 配置文件挂载（必须）- 修改后无需重新构建镜像
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - TZ=Asia/Shanghai
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://127.0.0.1:18789/healthz', timeout=3); assert r.status_code == 200"]
+      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://127.0.0.1:55000/healthz', timeout=3); assert r.status_code == 200"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -55,7 +55,10 @@
 | 🔒 **并发锁保护** | 同一仓库同时只能运行一条流水线，防止重复发版 |
 | 📊 **实时进度追踪** | 主卡 + 副卡架构，独立追踪每条流水线的运行状态与阶段 |
 | 📢 **全程通知** | 发版开始/结束自动通知群组并 @触发人 |
-| ⚡ **极速交互** | 分支缓存 + 全异步架构，下拉框切换毫秒级响应 |
+| ⚡ **全异步架构** | 全链路 `httpx.AsyncClient`，非阻塞 I/O，极速响应 |
+| 🔐 **用户权限控制** | 基于飞书 open_id 的 RBAC 权限，按项目/环境粒度管控 |
+| ✅ **审批流** | 生产环境发版自动发起审批，审批人通过卡片操作 |
+| 📋 **发版历史** | 一键查看仓库近期发版记录、状态和操作人 |
 
 ---
 
@@ -73,7 +76,7 @@
            ▼
 ┌──────────────────────────┐       ┌──────────────────┐
 │   FeishuCardOps 服务      │──────▶│   GitLab API      │
-│   FastAPI · :18789        │◀──────│   分支/流水线/任务  │
+│   FastAPI · :55000        │◀──────│   分支/流水线/任务  │
 └──────────────────────────┘       └──────────────────┘
            │
            │ 异步轮询 Pipeline 状态
@@ -92,6 +95,8 @@
   │◀──────── 下拉框即时刷新（缓存加速）──────────────────│
                                                        │
                                               ┌────────▼────────┐
+                                              │ 🔐 权限校验      │
+                                              │ ✅ 审批流（可选） │
                                               │ 🔒 按钮上锁      │
                                               │ 📤 副卡弹出追踪   │
                                               │ ⏳ 异步轮询状态   │
@@ -132,13 +137,15 @@ docker compose up -d --build
 ### 4. 验证
 
 ```bash
-curl http://localhost:18789/healthz
+curl http://localhost:55000/healthz
 # 返回 {"ok": true} 即为正常
 ```
 
 ---
 
 ## 📝 配置说明
+
+### 基础配置
 
 ```yaml
 # ---- 飞书应用凭证 ----
@@ -168,6 +175,32 @@ projects:
         id: 11
 ```
 
+### 权限控制配置
+
+```yaml
+permissions:
+  default_policy: "allow"          # 全局默认：allow / deny
+
+  rules:
+    - project: "*"                 # 匹配所有项目
+      env: "test"
+      policy: "allow"             # test 环境所有人可操作
+
+    - project: "*"
+      env: "prod"
+      policy: "deny"             # prod 默认拒绝
+      allow_users:                # 白名单
+        - "ou_xxxx"              # 飞书 open_id
+
+  # 审批流配置
+  approval_required:
+    - project: "*"
+      env: "prod"
+      approvers:
+        - "ou_approver1"
+        - "ou_approver2"
+```
+
 ### Pipeline 变量
 
 触发流水线时自动传递以下变量给 GitLab CI：
@@ -194,14 +227,14 @@ projects:
 
 | 配置项 | 值 |
 |--------|-----|
-| 请求地址 | `http://你的服务器:18789/feishu/event` |
+| 请求地址 | `http://你的服务器:55000/feishu/event` |
 | 订阅事件 | `接收消息 (im.message.receive_v1)` |
 
 ### 4. 配置卡片回调
 
 | 配置项 | 值 |
 |--------|-----|
-| 卡片请求网址 | `http://你的服务器:18789/feishu/card` |
+| 卡片请求网址 | `http://你的服务器:55000/feishu/card` |
 
 ### 5. 权限配置
 
@@ -237,16 +270,27 @@ docker compose up -d --build
 
 ```
 FeishuCardOps/
-├── app.py                 # 核心业务逻辑（FastAPI）
-├── config.yaml            # 运行时配置（⚠️ 含敏感信息，勿提交 Git）
-├── config.example.yaml    # 配置模板
-├── requirements.txt       # Python 依赖
-├── Dockerfile             # Docker 镜像构建
-├── docker-compose.yml     # Docker Compose 编排
-├── .dockerignore           # Docker 构建排除
-├── .gitignore             # Git 排除
-├── LICENSE                # MIT 开源协议
-└── README.md              # 本文档
+├── app.py                     # 入口文件（注册路由、健康检查）
+├── core/                      # 核心模块
+│   ├── config.py              # 配置加载
+│   ├── feishu_client.py       # 飞书 API 客户端（全异步）
+│   ├── gitlab_client.py       # GitLab API 客户端（全异步）
+│   ├── card_builder.py        # 卡片构建器（主卡/副卡/历史/审批）
+│   ├── permissions.py         # RBAC 权限控制
+│   └── state.py               # 全局内存状态管理
+├── routes/                    # 路由处理
+│   ├── card.py                # 卡片回调路由（含权限/审批/历史）
+│   └── event.py               # 事件订阅路由
+├── services/                  # 业务服务
+│   ├── pipeline.py            # 流水线触发与轮询（全异步）
+│   ├── history.py             # 发版历史记录
+│   └── approval.py            # 审批流管理
+├── config.yaml                # 运行时配置（⚠️ 含敏感信息，勿提交 Git）
+├── config.example.yaml        # 配置模板（含权限和审批示例）
+├── requirements.txt           # Python 依赖
+├── Dockerfile                 # Docker 镜像构建
+├── docker-compose.yml         # Docker Compose 编排
+└── README.md                  # 本文档
 ```
 
 ---
@@ -255,18 +299,26 @@ FeishuCardOps/
 
 - `config.yaml` 包含敏感凭证，已在 `.gitignore` 中排除，**请勿提交到 Git**
 - 建议部署在与飞书和 GitLab **同区域的国内服务器**，可获得最佳响应速度
-- 状态存储在内存中，服务重启后并发锁会重置（不影响已在运行的 GitLab 流水线）
+- 状态存储在内存中，服务重启后并发锁和历史记录会重置（不影响已在运行的 GitLab 流水线）
 - 生产环境建议使用 Nginx 反向代理 + HTTPS
+- 权限配置 `permissions` 段可选，不配置则保持向后兼容（所有用户可操作）
 
 ---
 
 ## 🗺️ Roadmap
 
-- [ ] Redis 持久化并发锁状态
-- [ ] RBAC 用户权限控制（限制生产环境发布权限）
-- [ ] 审批流（生产发版需领导审批）
-- [ ] Pipeline 历史记录面板
-- [ ] Prometheus 监控指标
+### 第一阶段（已完成）
+- [x] ~~模块化拆分（core/routes/services）~~
+- [x] ~~全异步改造（httpx.AsyncClient）~~
+- [x] ~~RBAC 用户权限控制~~
+- [x] ~~审批流（生产发版需审批）~~
+- [x] ~~Pipeline 发版历史记录~~
+
+### 第二阶段（TODO）
+1. [ ] 💽 **引入 Redis 持久化与高可用**：持久化卡片并发锁、历史记录与审批流水单，支持多副本部署
+2. [ ] 👤 **飞书实名制自动解析**：调用通讯录 API，自动把历史/审批卡片中的操作人 ID 解析为中文全名
+3. [ ] 📈 **运维指标监控 (Prometheus + Grafana)**：暴露 `/metrics` 接口，展示发版效率和成功率大盘指标
+4. [ ] ⏪ **“救命级”的一键回滚功能**：在历史记录卡片中为成功的版本提供「一键回滚」操作支持
 
 ---
 
