@@ -1,21 +1,66 @@
 """
-全局内存状态管理
+基于 Redis 的状态管理
 
-CARD_STATE:    卡片消息ID -> 用户选择状态（project, repo, branch, env, module 等）
-ACTION_DEDUP:  去重键 -> 上次触发时间戳
-REPO_LOCKS:    仓库 Project ID -> 是否正在发版（并发锁）
+用 Redis 替代原来的字典全局变量。
 """
+import json
+import logging
 from typing import Any, Dict
 
-CARD_STATE: Dict[str, Dict[str, Any]] = {}
-ACTION_DEDUP: Dict[str, float] = {}
-REPO_LOCKS: Dict[int, bool] = {}
+from core.redis_client import get_redis
 
-RUN_DEDUP_SECONDS = 4.0
-REFRESH_DEDUP_SECONDS = 1.5
+logger = logging.getLogger("feishu_gitlab_card_http")
+
+RUN_DEDUP_SECONDS = 4
+REFRESH_DEDUP_SECONDS = 2
 
 
-def cleanup_action_dedup(now_ts: float) -> None:
-    expired_keys = [k for k, v in ACTION_DEDUP.items() if now_ts - v > 30]
-    for k in expired_keys:
-        ACTION_DEDUP.pop(k, None)
+async def get_card_state(open_message_id: str) -> Dict[str, Any]:
+    if not open_message_id:
+        return {}
+    r = get_redis()
+    data = await r.get(f"card_state:{open_message_id}")
+    if data:
+        try:
+            return json.loads(str(data))
+        except Exception:
+            pass
+    return {}
+
+
+async def save_card_state(open_message_id: str, state: Dict[str, Any]) -> None:
+    if not open_message_id:
+        return
+    r = get_redis()
+    await r.setex(f"card_state:{open_message_id}", 7 * 24 * 3600, json.dumps(state, ensure_ascii=False))
+
+
+async def check_action_dedup(dedup_key: str, window_seconds: int) -> bool:
+    if not dedup_key:
+        return True
+    r = get_redis()
+    result = await r.set(f"action_dedup:{dedup_key}", "1", nx=True, ex=window_seconds)
+    return bool(result)
+
+
+async def is_repo_locked(repo_id: int) -> bool:
+    if not repo_id:
+        return False
+    r = get_redis()
+    return bool(await r.get(f"repo_lock:{repo_id}"))
+
+
+async def lock_repo(repo_id: int) -> None:
+    if not repo_id:
+        return
+    r = get_redis()
+    logger.info(f"locking repo_id={repo_id}")
+    await r.setex(f"repo_lock:{repo_id}", 3600, "1")
+
+
+async def unlock_repo(repo_id: int) -> None:
+    if not repo_id:
+        return
+    r = get_redis()
+    logger.info(f"unlocking repo_id={repo_id}")
+    await r.delete(f"repo_lock:{repo_id}")

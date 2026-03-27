@@ -21,6 +21,9 @@ server:
 gitlab:
   base_url: "http://your-gitlab-host:port"    # GitLab 实例地址
   access_token: "glpat-xxxxxxxxxxxx"           # GitLab Personal Access Token (需要 api 权限)
+# ---- Redis 存储配置 ----
+redis:
+  url: "redis://localhost:6379/0"             # 连接 URL (格式: redis://[:password]@host:port/db)
 
 # ---- 项目配置 ----
 # 支持多项目、多仓库、多环境、多微服务模块

@@ -13,12 +13,11 @@ from core.feishu_client import FeishuClient
 from core.gitlab_client import GitLabClient
 from core.permissions import check_approval_required, check_permission
 from core.state import (
-    ACTION_DEDUP,
-    CARD_STATE,
-    REFRESH_DEDUP_SECONDS,
-    REPO_LOCKS,
-    RUN_DEDUP_SECONDS,
-    cleanup_action_dedup,
+    check_action_dedup,
+    get_card_state,
+    is_repo_locked,
+    lock_repo,
+    save_card_state,
 )
 from services.approval import create_approval, get_approval, resolve_approval
 from services.history import get_history
@@ -67,7 +66,7 @@ async def feishu_card(request: Request):
     operator = event.get("operator", {}) or {}
     operator_open_id = operator.get("open_id") or ""
 
-    stored_state = CARD_STATE.get(open_message_id, {}) if open_message_id else {}
+    stored_state = await get_card_state(open_message_id)
 
     action_name = None
     if isinstance(raw_value, dict):
@@ -102,7 +101,6 @@ async def feishu_card(request: Request):
         return JSONResponse({"toast": {"type": toast_type, "content": result["msg"]}})
 
     # ── 常规卡片交互：解析选择项 ────────────────────────────────
-    # Handle dropdown cascades:
     if current_field == "project" and option:
         projects = cfg.get("projects", [])
         project = next((p for p in projects if p["name"] == option), None)
@@ -153,27 +151,23 @@ async def feishu_card(request: Request):
     gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
 
     cached_branches = None
-    if stored_state.get("repo") == selected_repo and stored_state.get("branches"):
+    if current_field not in ["project", "repo", "refresh"] and stored_state.get("repo") == selected_repo and stored_state.get("branches"):
         cached_branches = stored_state.get("branches")
 
     state = await normalize_selection(cfg, gitlab, selected_project, selected_repo, selected_branch, selected_env, cached_branches, selected_module)
 
     if open_message_id:
-        CARD_STATE[open_message_id] = dict(state)
+        await save_card_state(open_message_id, state)
     logger.info("card action merged state=%s", state)
 
     # ── 去重 ───────────────────────────────────────────────────
     dedup_key = ""
     if action_name in {"run", "refresh", "history"}:
         dedup_key = f"{open_message_id}:{action_name}:{state['project']}:{state['repo']}:{state['branch']}:{state['env']}"
-        now_ts = time.time()
-        cleanup_action_dedup(now_ts)
-        last_ts = ACTION_DEDUP.get(dedup_key, 0)
-        dedup_window = RUN_DEDUP_SECONDS if action_name == "run" else REFRESH_DEDUP_SECONDS
-        if now_ts - last_ts < dedup_window:
+        dedup_window = 4 if action_name == "run" else 2
+        if not await check_action_dedup(dedup_key, dedup_window):
             logger.info("dedup hit key=%s", dedup_key)
             return JSONResponse({})
-        ACTION_DEDUP[dedup_key] = now_ts
 
     status = "就绪"
     latest_pipeline_text = "暂无"
@@ -188,7 +182,7 @@ async def feishu_card(request: Request):
 
     # ── 历史记录 ─────────────────────────────────────────────────
     if action_name == "history":
-        records = get_history(state["repo_id"])
+        records = await get_history(state["repo_id"])
         history_card = build_history_card(records, state)
         if open_message_id:
             asyncio.create_task(delayed_update_card(feishu_client, open_message_id, history_card, 0.05))
@@ -199,7 +193,7 @@ async def feishu_card(request: Request):
         if "⚠️" in state["branch"]:
             return JSONResponse({"toast": {"type": "error", "content": "远程分支读取失败，请重新切一次仓库刷出正常分支后再执行！"}})
 
-        if REPO_LOCKS.get(state["repo_id"]):
+        if await is_repo_locked(state["repo_id"]):
             logger.warning("Repo %s is locked, run rejected.", state["repo_id"])
             return JSONResponse({"toast": {"type": "error", "content": "该仓正在发布，请稍后"}})
 
@@ -219,10 +213,10 @@ async def feishu_card(request: Request):
             return JSONResponse({"toast": {"type": "info", "content": f"🔐 已发起审批请求 (#{approval_id})，请等待审批人操作"}})
 
         # ── 直接触发 ────────────────────────────────────────────
-        REPO_LOCKS[state["repo_id"]] = True
+        await lock_repo(state["repo_id"])
         asyncio.create_task(background_run_pipeline(feishu_client, gitlab, cfg, state, open_message_id, operator_open_id, open_chat_id))
 
-        card = build_card(cfg, status="执行中", state=state, latest_pipeline_text="初始化中...", latest_result_text="已接收发版指令正在投递...", show_details=True)
+        card = build_card(cfg, status="执行中", state=state, latest_pipeline_text="初始化中...", latest_result_text="已接收发版指令正在投递...", show_details=True, is_locked=True)
         if open_message_id:
             asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, 1.0))
 
@@ -255,15 +249,17 @@ async def feishu_card(request: Request):
 
     card = build_card(
         cfg,
-        state=state,
         status=status,
+        state=state,
         latest_pipeline_text=latest_pipeline_text,
         latest_result_text=latest_result_text,
         show_details=(action_name in {"run", "refresh"} or action.get("tag") == "select_static"),
+        is_locked=await is_repo_locked(state.get("repo_id", -1)),
     )
 
     response_body = {}
     if open_message_id and (action_name in {"refresh"} or action.get("tag") == "select_static"):
+        # 下拉框切换和刷新：先返回空对象给飞书（避免200672格式错误），再异步推送新卡片
         asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, 0.05))
         response_body = {}
 

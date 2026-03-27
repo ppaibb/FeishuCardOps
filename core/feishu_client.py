@@ -11,21 +11,17 @@ logger = logging.getLogger("feishu_gitlab_card_http")
 class FeishuClient:
     """飞书开放平台 API 客户端（全异步 + tenant_access_token 自动缓存）"""
 
-    # 类级别 Token 缓存，相同 app_id 的不同实例共享
-    _token_store: Dict[str, str] = {}
-    _token_expires: Dict[str, float] = {}
-
     def __init__(self, app_id: str, app_secret: str, base_url: str = "https://open.feishu.cn"):
         self.app_id = app_id
         self.app_secret = app_secret
         self.base_url = base_url.rstrip("/")
 
     async def tenant_access_token(self) -> str:
-        now = time.time()
-        cached = self._token_store.get(self.app_id)
-        expires_at = self._token_expires.get(self.app_id, 0)
-        if cached and now < expires_at:
-            return cached
+        from core.redis_client import get_redis
+        r = get_redis()
+        token_key = f"feishu_tenant_token:{self.app_id}"
+        cached = await r.get(token_key)
+        if cached: return str(cached)
 
         url = f"{self.base_url}/open-apis/auth/v3/tenant_access_token/internal"
         payload = {"app_id": self.app_id, "app_secret": self.app_secret}
@@ -38,10 +34,33 @@ class FeishuClient:
 
         token = data["tenant_access_token"]
         expire = data.get("expire", 7200)
-        self._token_store[self.app_id] = token
-        self._token_expires[self.app_id] = now + expire - 300  # 提前 5 分钟刷新
+        safe_expire = max(expire - 300, 60)
+        await r.setex(token_key, safe_expire, token)
         logger.info("tenant_access_token refreshed, expires_in=%ss", expire)
         return token
+
+    async def get_user_name(self, open_id: str) -> str:
+        if not open_id: return ""
+        from core.redis_client import get_redis
+        r = get_redis()
+        cache_key = f"feishu_user_name:{open_id}"
+        cached_name = await r.get(cache_key)
+        if cached_name: return str(cached_name)
+
+        token = await self.tenant_access_token()
+        url = f"{self.base_url}/open-apis/contact/v3/users/{open_id}?user_id_type=open_id"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+                data = res.json()
+                if data.get("code") == 0:
+                    name = data.get("data", {}).get("user", {}).get("name", "")
+                    if name:
+                        await r.setex(cache_key, 7 * 24 * 3600, name)
+                        return name
+        except Exception as e:
+            logger.error("failed to get user name for %s: %s", open_id, e)
+        return open_id
 
     async def send_card(self, chat_id: str, card: Dict[str, Any]) -> Dict[str, Any]:
         token = await self.tenant_access_token()

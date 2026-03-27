@@ -2,7 +2,6 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from core.gitlab_client import GitLabClient
-from core.state import REPO_LOCKS
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
@@ -78,21 +77,22 @@ async def normalize_selection(
     }
 
 
-def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: int, p_status: str, active_job_name: str, failed_job_info: str = "") -> Dict[str, Any]:
+def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: int, p_status: str, active_job_name: str, failed_job_info: str = "", commit_info: str = "") -> Dict[str, Any]:
+    commit_line = f"\n**提交**：{commit_info}" if commit_info else ""
     if p_status == "success":
         color = "green"
         emoji = "✅"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务已执行成功！** 🎉\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id}"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务已执行成功！** 🎉\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id}"
     elif p_status in {"failed", "canceled"}:
         color = "red"
         emoji = "❌"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务执行异常终止！**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id} [{p_status}]"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务执行异常终止！**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id} [{p_status}]"
         if failed_job_info:
             content += f"\n\n**失败点**：\n🚨 {failed_job_info}"
     else:
         color = "blue"
         emoji = "⏳"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务追踪中...**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id}\n**当前进展**：正在跟进 {active_job_name}"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务追踪中...**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id}\n**当前进展**：正在跟进 {active_job_name}"
 
     return {
         "config": {"wide_screen_mode": True},
@@ -110,15 +110,13 @@ def build_history_card(
         content = "📭 暂无发版历史记录"
     else:
         lines = []
-        for i, rec in enumerate(history_records[:10], 1):
+        for i, rec in enumerate(history_records[:15], 1):
             status_emoji = {"success": "✅", "failed": "❌", "canceled": "⚠️", "running": "🔄"}.get(rec.get("status", ""), "⏳")
             line = f"{i}. {status_emoji} **#{rec['pipeline_id']}** | `{rec['branch']}` → `{rec['env']}`"
-            if rec.get("module"):
-                line += f" / `{rec['module']}`"
-            if rec.get("operator_name"):
-                line += f" | 👤 {rec['operator_name']}"
-            if rec.get("triggered_at"):
-                line += f"\n    🕐 {rec['triggered_at']}"
+            if rec.get("module"): line += f" / `{rec['module']}`"
+            if rec.get("operator_name") and rec["operator_name"] != rec.get("operator_open_id"): line += f" | 👤 {rec['operator_name']}"
+            elif rec.get("operator_open_id"): line += f" | 👤 <at id=\"{rec['operator_open_id']}\"></at>"
+            if rec.get("triggered_at"): line += f"\n    🕐 {rec['triggered_at']}"
             if rec.get("finished_at"):
                 line += f" → {rec['finished_at']}"
             lines.append(line)
@@ -207,12 +205,8 @@ def build_approval_card(
 
 
 def build_card(
-    cfg: Dict[str, Any],
-    status: str,
-    state: Dict[str, Any],
-    latest_pipeline_text: Optional[str] = None,
-    latest_result_text: Optional[str] = None,
-    show_details: bool = False,
+    cfg: Dict[str, Any], status: str, state: Dict[str, Any], latest_pipeline_text: Optional[str] = None,
+    latest_result_text: Optional[str] = None, show_details: bool = False, is_locked: bool = False,
 ) -> Dict[str, Any]:
     projects = cfg.get("projects", [])
     project = next((p for p in projects if p["name"] == state["project"]), projects[0])
@@ -447,8 +441,6 @@ def build_card(
         })
 
     elements.append({"tag": "hr"})
-
-    is_locked = REPO_LOCKS.get(state.get("repo_id", -1), False)
 
     if is_locked:
         action_elements = [

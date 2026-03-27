@@ -58,7 +58,9 @@
 | ⚡ **全异步架构** | 全链路 `httpx.AsyncClient`，非阻塞 I/O，极速响应 |
 | 🔐 **用户权限控制** | 基于飞书 open_id 的 RBAC 权限，按项目/环境粒度管控 |
 | ✅ **审批流** | 生产环境发版自动发起审批，审批人通过卡片操作 |
-| 📋 **发版历史** | 一键查看仓库近期发版记录、状态和操作人 |
+| 📋 **发版历史** | 一键查看仓库近 100 条发版记录、状态和操作人 |
+| 💽 **Redis 持久化** | 并发锁/去重/历史/审批/Token 全部持久化存储，支持多副本部署 |
+| 👤 **飞书实名解析** | 自动调用通讯录 API 将 open_id 解析为中文姓名（7天缓存） |
 
 ---
 
@@ -110,7 +112,8 @@
 
 ### 前置条件
 
-- Docker 20.10+ & Docker Compose v2+
+- Docker 20.10+ & Docker Compose v2+（或 Python 3.10+）
+- Redis 5.0+（本地或远程）
 - 飞书开放平台企业自建应用
 - GitLab Personal Access Token（`api` 权限）
 
@@ -210,6 +213,8 @@ permissions:
 | `ENV` | 部署环境 | `test` |
 | `DEPLOY_ENV` | 部署环境（兼容字段） | `prod` |
 | `TARGET_MODULE` | 微服务模块（仅配置了 modules 时传递） | `service-user` |
+| `OPERATOR_NAME` | 触发人飞书中文姓名 | `闫东` |
+| `OPERATOR_OPEN_ID` | 触发人飞书 open_id | `ou_505a3130...` |
 
 ---
 
@@ -271,22 +276,24 @@ docker compose up -d --build
 ```
 FeishuCardOps/
 ├── app.py                     # 入口文件（注册路由、健康检查）
+├── run.py                     # Windows 安全启动器（防 WinError 64 闪退）
 ├── core/                      # 核心模块
 │   ├── config.py              # 配置加载
-│   ├── feishu_client.py       # 飞书 API 客户端（全异步）
+│   ├── redis_client.py        # Redis 异步连接池（单例）
+│   ├── feishu_client.py       # 飞书 API 客户端（全异步 + Redis Token 缓存）
 │   ├── gitlab_client.py       # GitLab API 客户端（全异步）
 │   ├── card_builder.py        # 卡片构建器（主卡/副卡/历史/审批）
 │   ├── permissions.py         # RBAC 权限控制
-│   └── state.py               # 全局内存状态管理
+│   └── state.py               # Redis 状态管理（锁/去重/卡片状态）
 ├── routes/                    # 路由处理
 │   ├── card.py                # 卡片回调路由（含权限/审批/历史）
 │   └── event.py               # 事件订阅路由
 ├── services/                  # 业务服务
-│   ├── pipeline.py            # 流水线触发与轮询（全异步）
-│   ├── history.py             # 发版历史记录
-│   └── approval.py            # 审批流管理
+│   ├── pipeline.py            # 流水线触发与轮询（全异步 + Commit 追踪）
+│   ├── history.py             # 发版历史记录（Redis 持久化，100条/仓库）
+│   └── approval.py            # 审批流管理（Redis 持久化，7天有效）
 ├── config.yaml                # 运行时配置（⚠️ 含敏感信息，勿提交 Git）
-├── config.example.yaml        # 配置模板（含权限和审批示例）
+├── config.example.yaml        # 配置模板（含 Redis/权限/审批示例）
 ├── requirements.txt           # Python 依赖
 ├── Dockerfile                 # Docker 镜像构建
 ├── docker-compose.yml         # Docker Compose 编排
@@ -298,8 +305,9 @@ FeishuCardOps/
 ## ⚠️ 注意事项
 
 - `config.yaml` 包含敏感凭证，已在 `.gitignore` 中排除，**请勿提交到 Git**
-- 建议部署在与飞书和 GitLab **同区域的国内服务器**，可获得最佳响应速度
-- 状态存储在内存中，服务重启后并发锁和历史记录会重置（不影响已在运行的 GitLab 流水线）
+- 需要运行 Redis 实例（默认连接 `redis://localhost:6379/0`），可在 `config.yaml` 中配置
+- 所有状态（并发锁、历史记录、审批单、Token）均持久化在 Redis 中，服务重启不丢数据
+- Windows 本地开发建议使用 `python run.py` 启动，可避免 asyncio WinError 64 闪退
 - 生产环境建议使用 Nginx 反向代理 + HTTPS
 - 权限配置 `permissions` 段可选，不配置则保持向后兼容（所有用户可操作）
 
@@ -314,11 +322,15 @@ FeishuCardOps/
 - [x] ~~审批流（生产发版需审批）~~
 - [x] ~~Pipeline 发版历史记录~~
 
-### 第二阶段（TODO）
-1. [ ] 💽 **引入 Redis 持久化与高可用**：持久化卡片并发锁、历史记录与审批流水单，支持多副本部署
-2. [ ] 👤 **飞书实名制自动解析**：调用通讯录 API，自动把历史/审批卡片中的操作人 ID 解析为中文全名
-3. [ ] 📈 **运维指标监控 (Prometheus + Grafana)**：暴露 `/metrics` 接口，展示发版效率和成功率大盘指标
-4. [ ] ⏪ **“救命级”的一键回滚功能**：在历史记录卡片中为成功的版本提供「一键回滚」操作支持
+### 第二阶段（已完成）
+- [x] ~~💽 Redis 持久化与高可用：并发锁、历史记录、审批流、Token 全部持久化~~
+- [x] ~~👤 飞书实名解析：自动调用通讯录 API 解析 open_id 为中文全名（7天缓存）~~
+- [x] ~~🔗 Commit 追踪：进度卡片展示 commit hash 并提供 GitLab 链接~~
+- [x] ~~📤 CI 变量注入：自动向 GitLab Pipeline 传递 OPERATOR_NAME / OPERATOR_OPEN_ID~~
+
+### 第三阶段（TODO）
+1. [ ] 📈 **运维指标监控 (Prometheus + Grafana)**：暴露 `/metrics` 接口，展示发版效率和成功率大盘指标
+2. [ ] ⏪ **“救命级”的一键回滚功能**：在历史记录卡片中为成功的版本提供「一键回滚」操作支持
 
 ---
 
