@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua
 
 # 拷贝应用代码
 COPY app.py .
+COPY run.py .
 COPY core/ core/
 COPY routes/ routes/
 COPY services/ services/

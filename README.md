@@ -213,7 +213,7 @@ permissions:
 | `ENV` | 部署环境 | `test` |
 | `DEPLOY_ENV` | 部署环境（兼容字段） | `prod` |
 | `TARGET_MODULE` | 微服务模块（仅配置了 modules 时传递） | `service-user` |
-| `OPERATOR_NAME` | 触发人飞书中文姓名 | `闫东` |
+| `OPERATOR_NAME` | 触发人飞书中文姓名 | `张三` |
 | `OPERATOR_OPEN_ID` | 触发人飞书 open_id | `ou_505a3130...` |
 
 ---
@@ -305,7 +305,7 @@ FeishuCardOps/
 ## ⚠️ 注意事项
 
 - `config.yaml` 包含敏感凭证，已在 `.gitignore` 中排除，**请勿提交到 Git**
-- 需要运行 Redis 实例（默认连接 `redis://localhost:6379/0`），可在 `config.yaml` 中配置
+- 需要运行 Redis 实例；Docker 部署时 `config.yaml` 中 Redis URL 应改为 `redis://redis:6379/0`（使用服务名），本地开发用 `redis://localhost:6379/0`
 - 所有状态（并发锁、历史记录、审批单、Token）均持久化在 Redis 中，服务重启不丢数据
 - Windows 本地开发建议使用 `python run.py` 启动，可避免 asyncio WinError 64 闪退
 - 生产环境建议使用 Nginx 反向代理 + HTTPS
