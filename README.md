@@ -61,6 +61,7 @@
 | 📋 **发版历史** | 一键查看仓库近 100 条发版记录、状态和操作人 |
 | 💽 **Redis 持久化** | 并发锁/去重/历史/审批/Token 全部持久化存储，支持多副本部署 |
 | 👤 **飞书实名解析** | 自动调用通讯录 API 将 open_id 解析为中文姓名（7天缓存） |
+| 🤖 **AI Code Review** | 发版前一键 AI 代码审查，自动获取 MR/分支变更并生成风险评估报告 |
 
 ---
 
@@ -328,7 +329,10 @@ FeishuCardOps/
 - [x] ~~🔗 Commit 追踪：进度卡片展示 commit hash 并提供 GitLab 链接~~
 - [x] ~~📤 CI 变量注入：自动向 GitLab Pipeline 传递 OPERATOR_NAME / OPERATOR_OPEN_ID~~
 
-### 第三阶段（TODO）
+### 第三阶段（已完成）
+- [x] ~~🤖 AI Code Review：发版前一键 AI 代码审查，优先获取 MR 变更，无 MR 自动降级为分支对比（MiniMax-M2.7）~~
+
+### 第四阶段（TODO）
 1. [ ] 📈 **运维指标监控 (Prometheus + Grafana)**：暴露 `/metrics` 接口，展示发版效率和成功率大盘指标
 2. [ ] ⏪ **“救命级”的一键回滚功能**：在历史记录卡片中为成功的版本提供「一键回滚」操作支持
 
