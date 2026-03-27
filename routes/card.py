@@ -21,7 +21,7 @@ from core.state import (
 )
 from services.approval import create_approval, get_approval, resolve_approval
 from services.history import get_history
-from services.pipeline import background_run_pipeline, delayed_update_card
+from services.pipeline import background_run_pipeline, delayed_update_card, next_card_version
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
@@ -67,6 +67,11 @@ async def feishu_card(request: Request):
     operator_open_id = operator.get("open_id") or ""
 
     stored_state = await get_card_state(open_message_id)
+
+    logger.info("CARD_DEBUG msg_id=%s tag=%s name=%s option=%s current_field=%s raw_value=%s",
+                open_message_id, action.get("tag"), action.get("name"), action.get("option"),
+                raw_value.get("current_field") if isinstance(raw_value, dict) else None,
+                json.dumps(raw_value, ensure_ascii=False)[:500] if isinstance(raw_value, dict) else raw_value)
 
     action_name = None
     if isinstance(raw_value, dict):
@@ -188,6 +193,12 @@ async def feishu_card(request: Request):
             asyncio.create_task(delayed_update_card(feishu_client, open_message_id, history_card, 0.05))
         return JSONResponse({})
 
+    # ── AI Code Review ────────────────────────────────────────────
+    if action_name == "review":
+        from services.code_review import run_code_review
+        asyncio.create_task(run_code_review(feishu_client, gitlab, state, open_chat_id, operator_open_id))
+        return JSONResponse({"toast": {"type": "info", "content": "🤖 AI 正在审查代码，结果稍后发送到群聊..."}})
+
     # ── 执行发版 ─────────────────────────────────────────────────
     if action_name == "run":
         if "⚠️" in state["branch"]:
@@ -258,10 +269,10 @@ async def feishu_card(request: Request):
     )
 
     response_body = {}
-    if open_message_id and (action_name in {"refresh"} or action.get("tag") == "select_static"):
-        # 下拉框切换和刷新：先返回空对象给飞书（避免200672格式错误），再异步推送新卡片
-        asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, 0.05))
-        response_body = {}
+    if open_message_id:
+        ver = next_card_version(open_message_id)
+        delay = 0 if action.get("tag") == "select_static" else 0.05
+        asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, delay, version=ver))
 
     logger.info("/feishu/card response=%s", json.dumps(response_body, ensure_ascii=False)[:3000])
     return JSONResponse(response_body)

@@ -12,9 +12,27 @@ from services.history import add_record, update_record_status
 logger = logging.getLogger("feishu_gitlab_card_http")
 
 
-async def delayed_update_card(feishu_client: FeishuClient, open_message_id: str, card: Dict[str, Any], delay_seconds: float = 1.0) -> None:
+# 每个 message_id 的最新更新版本号，防止旧的异步推送覆盖新的
+_card_update_versions: Dict[str, int] = {}
+_version_counter = 0
+
+
+def next_card_version(open_message_id: str) -> int:
+    """为指定 message_id 分配新版本号，返回版本号"""
+    global _version_counter
+    _version_counter += 1
+    _card_update_versions[open_message_id] = _version_counter
+    return _version_counter
+
+
+async def delayed_update_card(feishu_client: FeishuClient, open_message_id: str, card: Dict[str, Any], delay_seconds: float = 1.0, version: int = 0) -> None:
     try:
-        await asyncio.sleep(delay_seconds)
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+        # 版本检查：如果有更新的版本已经注册，放弃本次推送
+        if version and _card_update_versions.get(open_message_id, 0) != version:
+            logger.info("skipped stale card update open_message_id=%s version=%s current=%s", open_message_id, version, _card_update_versions.get(open_message_id))
+            return
         result = await feishu_client.update_card(open_message_id, card)
         logger.info("delayed updated current card open_message_id=%s result=%s", open_message_id, json.dumps(result, ensure_ascii=False)[:1000])
     except Exception:

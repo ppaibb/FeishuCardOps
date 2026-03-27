@@ -450,11 +450,6 @@ def build_card(
                 "type": "default",
                 "value": {**action_base_val, "action": "locked"},
             },
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "🔄 刷新当前状态"},
-                "value": {**action_base_val, "action": "refresh"},
-            },
         ]
     else:
         action_elements = [
@@ -466,8 +461,8 @@ def build_card(
             },
             {
                 "tag": "button",
-                "text": {"tag": "plain_text", "content": "🔄 刷新当前状态"},
-                "value": {**action_base_val, "action": "refresh"},
+                "text": {"tag": "plain_text", "content": "🤖 AI Review"},
+                "value": {**action_base_val, "action": "review"},
             },
             {
                 "tag": "button",

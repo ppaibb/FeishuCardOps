@@ -69,3 +69,47 @@ class GitLabClient:
         if isinstance(pipelines, list) and pipelines:
             return pipelines[0]
         return None
+
+    async def get_default_branch(self, project_id: int) -> str:
+        url = f"{self.base_url}/api/v4/projects/{project_id}"
+        headers = {"PRIVATE-TOKEN": self.token}
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json().get("default_branch", "main")
+        return "main"
+
+    async def compare_branches(self, project_id: int, from_branch: str, to_branch: str) -> Dict[str, Any]:
+        """对比两个分支的差异，返回 commits 和 diffs"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/compare"
+        headers = {"PRIVATE-TOKEN": self.token}
+        params = {"from": from_branch, "to": to_branch, "straight": "false"}
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 200:
+                return resp.json()
+            logger.error("compare_branches failed status=%s body=%s", resp.status_code, resp.text[:500])
+            return {}
+
+    async def get_latest_mr(self, project_id: int, source_branch: str) -> Optional[Dict[str, Any]]:
+        """获取指定源分支的最新 Merge Request"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/merge_requests"
+        headers = {"PRIVATE-TOKEN": self.token}
+        params = {"source_branch": source_branch, "order_by": "updated_at", "sort": "desc", "per_page": 1}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 200:
+                mrs = resp.json()
+                return mrs[0] if mrs else None
+        return None
+
+    async def get_mr_changes(self, project_id: int, mr_iid: int) -> Dict[str, Any]:
+        """获取 MR 的代码变更详情"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/changes"
+        headers = {"PRIVATE-TOKEN": self.token}
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            logger.error("get_mr_changes failed status=%s body=%s", resp.status_code, resp.text[:500])
+            return {}
