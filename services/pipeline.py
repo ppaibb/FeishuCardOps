@@ -45,10 +45,9 @@ async def poll_pipeline_status(
     cfg: Dict[str, Any],
     project_id: int,
     pipeline_id: int,
-    sub_message_id: str,
+    sub_message_ids: list,
     state: Dict[str, Any],
     operator_open_id: str = "",
-    open_chat_id: str = "",
     open_message_id: str = "",
 ) -> None:
     final_status = "unknown"
@@ -68,8 +67,8 @@ async def poll_pipeline_status(
             active_job_name = active_jobs[0]["name"] if active_jobs else "阶段衔接中"
 
             failed_job_info = ""
-            if p_status == "failed":
-                failed_jobs = [j for j in jobs if j.get("status") == "failed"]
+            if p_status in {"failed", "canceled"}:
+                failed_jobs = [j for j in jobs if j.get("status") in {"failed", "canceled"}]
                 if failed_jobs:
                     fj = failed_jobs[0]
                     fj_name = fj.get("name", "unknown")
@@ -77,13 +76,31 @@ async def poll_pipeline_status(
                     failed_job_info = f"环节 **{fj_name}** 执行失败"
                     if fj_url:
                         failed_job_info += f"  —  [查看报错日志]({fj_url})"
+                    
+                    # 取最后 3000 字符让 AI 分析
+                    trace = await gitlab_client.get_job_trace(project_id, fj["id"])
+                    if trace:
+                        trace_tail = trace[-3000:]
+                        from services.code_review import diagnose_job_log
+                        ai_cause = await diagnose_job_log(cfg, fj_name, trace_tail)
+                        failed_job_info += f"\n\n**🤖 AI 故障诊断**：{ai_cause}"
 
-            commit_sha = (pipeline.get("sha") or "")[:8]
+            commit_sha = pipeline.get("sha") or ""
             commit_url = pipeline.get("web_url") or ""
-            commit_info = f"[{commit_sha}]({commit_url})" if commit_url else commit_sha
+            commit_info = f"[{commit_sha[:8]}]({commit_url})" if commit_url and commit_sha else commit_sha[:8]
+            
+            if commit_sha:
+                commit_data = await gitlab_client.get_commit(project_id, commit_sha)
+                if commit_data:
+                    author = commit_data.get("author_name", "")
+                    title = commit_data.get("title", "")
+                    if author and title:
+                        commit_info += f" - {title} ({author})"
 
             sub_card = build_sub_card(state, operator_open_id, pipeline_id, p_status, active_job_name, failed_job_info, commit_info)
-            await feishu_client.update_card(sub_message_id, sub_card)
+            for sid in sub_message_ids:
+                if sid:
+                    await feishu_client.update_card(sid, sub_card)
 
             if p_status in {"success", "failed", "canceled"}:
                 final_status = p_status
@@ -123,8 +140,14 @@ async def background_run_pipeline(
 ) -> None:
     try:
         variables = {"ENV": state["env"], "DEPLOY_ENV": state["env"]}
-        if state.get("module"):
+        # 兼容老版，如果有 module 且没有 var_TARGET_MODULE，自动注入
+        if state.get("module") and "TARGET_MODULE" not in state.get("variables", {}):
             variables["TARGET_MODULE"] = state["module"]
+            
+        # 自动注入所有配置的变量
+        if state.get("variables"):
+            for k, v in state["variables"].items():
+                variables[k] = str(v)
 
         try:
             operator_name = await feishu_client.get_user_name(operator_open_id)
@@ -137,21 +160,46 @@ async def background_run_pipeline(
         pipeline = await gitlab_client.trigger_pipeline(project_id=state["repo_id"], ref=state["branch"], variables=variables)
         pipeline_id = pipeline.get("id")
 
+        module_display = state.get("module")
+        if not module_display and state.get("variables"):
+            module_display = ", ".join([f"{k}={v}" for k, v in state["variables"].items()])
+
         await add_record(
             repo_id=state["repo_id"], pipeline_id=pipeline_id, project_name=state["project"], repo_name=state["repo"],
             branch=state["branch"], env=state["env"], operator_open_id=operator_open_id, operator_name=operator_name,
-            module=state.get("module"), status="running"
+            module=module_display, status="running"
         )
 
+        commit_sha = pipeline.get("sha") or ""
+        commit_url = pipeline.get("web_url") or ""
+        commit_info = f"[{commit_sha[:8]}]({commit_url})" if commit_url and commit_sha else commit_sha[:8]
+        
+        if commit_sha:
+            commit_data = await gitlab_client.get_commit(state["repo_id"], commit_sha)
+            if commit_data:
+                author = commit_data.get("author_name", "")
+                title = commit_data.get("title", "")
+                if author and title:
+                    commit_info += f" - {title} ({author})"
+        initial_sub_card = build_sub_card(state, operator_open_id or "", pipeline_id, "created", "流水线初始化", "", commit_info)
+        
+        sub_message_ids = []
         if open_chat_id:
-            commit_sha = (pipeline.get("sha") or "")[:8]
-            commit_url = pipeline.get("web_url") or ""
-            commit_info = f"[{commit_sha}]({commit_url})" if commit_url else commit_sha
-            initial_sub_card = build_sub_card(state, operator_open_id or "", pipeline_id, "created", "流水线初始化", "", commit_info)
             resp = await feishu_client.send_card(open_chat_id, initial_sub_card)
             sub_msg_id = resp.get("data", {}).get("message_id")
             if sub_msg_id:
-                asyncio.create_task(poll_pipeline_status(feishu_client, gitlab_client, cfg, state["repo_id"], pipeline_id, sub_msg_id, state, operator_open_id, open_chat_id, open_message_id))
+                sub_message_ids.append(sub_msg_id)
+                
+        # 审计群组同步逻辑
+        audit_chat_id = cfg.get("feishu", {}).get("audit_chat_id")
+        if audit_chat_id and audit_chat_id != open_chat_id:
+            audit_resp = await feishu_client.send_card(audit_chat_id, initial_sub_card)
+            audit_msg_id = audit_resp.get("data", {}).get("message_id")
+            if audit_msg_id:
+                sub_message_ids.append(audit_msg_id)
+
+        if sub_message_ids:
+            asyncio.create_task(poll_pipeline_status(feishu_client, gitlab_client, cfg, state["repo_id"], pipeline_id, sub_message_ids, state, operator_open_id, open_message_id))
     except Exception as e:
         logger.error("background run failed %s", e)
         if state.get("repo_id"):

@@ -16,6 +16,7 @@ from core.state import (
     check_action_dedup,
     get_card_state,
     is_repo_locked,
+    try_lock_repo,
     lock_repo,
     save_card_state,
 )
@@ -101,9 +102,26 @@ async def feishu_card(request: Request):
         approval_id = raw_value.get("approval_id") if isinstance(raw_value, dict) else None
         if not approval_id:
             return JSONResponse({"toast": {"type": "error", "content": "审批记录无效"}})
+            
+        # 审批去重，避免并发操作导致重复触发发版
+        dedup_key = f"approval_lock:{approval_id}"
+        if not await check_action_dedup(dedup_key, 2):
+            logger.info("dedup hit approval %s by %s", approval_id, operator_open_id)
+            return JSONResponse({"toast": {"type": "info", "content": "处理中，请稍候"}})
+            
         result = await resolve_approval(approval_id, action_name, operator_open_id)
         toast_type = "success" if result["ok"] else "error"
         return JSONResponse({"toast": {"type": toast_type, "content": result["msg"]}})
+
+    # Collect incoming config variables
+    incoming_vars = {}
+    if isinstance(raw_value, dict):
+        for k, v in raw_value.items():
+            if k.startswith("var_"):
+                incoming_vars[k[4:]] = str(v)
+                
+    selected_vars = stored_state.get("variables", {}).copy() if stored_state else {}
+    selected_vars.update(incoming_vars)
 
     # ── 常规卡片交互：解析选择项 ────────────────────────────────
     if current_field == "project" and option:
@@ -117,40 +135,36 @@ async def feishu_card(request: Request):
         selected_repo = pick_repo
         selected_branch = None
         selected_env = stored_state.get("env")
-        selected_module = None
     elif action.get("tag") == "select_static":
         selected_project = stored_state.get("project") or pick_value("project")
         selected_repo = stored_state.get("repo") or pick_value("repo")
         selected_branch = stored_state.get("branch") or pick_value("branch")
         selected_env = stored_state.get("env") or pick_value("env")
-        selected_module = stored_state.get("module") or pick_value("module")
         if current_field == "repo" and option:
             selected_repo = option
             selected_branch = None
-            selected_module = None
+            selected_vars = {}
         elif current_field == "branch" and option:
             selected_branch = option
         elif current_field == "env" and option:
             selected_env = option
-        elif current_field == "module" and option:
-            selected_module = option
+        elif current_field and current_field.startswith("var_") and option:
+            selected_vars[current_field[4:]] = option
     elif action_name in {"run", "refresh", "history"} and stored_state:
         selected_project = stored_state.get("project")
         selected_repo = stored_state.get("repo")
         selected_branch = stored_state.get("branch")
         selected_env = stored_state.get("env")
-        selected_module = stored_state.get("module")
     else:
         selected_project = pick_value("project") or stored_state.get("project")
         selected_repo = pick_value("repo") or stored_state.get("repo")
         selected_branch = pick_value("branch") or stored_state.get("branch")
         selected_env = pick_value("env") or stored_state.get("env")
-        selected_module = pick_value("module") or stored_state.get("module")
 
     logger.info(
-        "card action parsed open_message_id=%s action_name=%s current_field=%s option=%s stored_state=%s selected_project=%s selected_repo=%s selected_branch=%s selected_env=%s selected_module=%s",
+        "card action parsed open_message_id=%s action_name=%s current_field=%s option=%s stored_state=%s selected_project=%s selected_repo=%s selected_branch=%s selected_env=%s selected_vars=%s",
         open_message_id, action_name, current_field, option, stored_state,
-        selected_project, selected_repo, selected_branch, selected_env, selected_module,
+        selected_project, selected_repo, selected_branch, selected_env, selected_vars,
     )
 
     gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
@@ -159,7 +173,7 @@ async def feishu_card(request: Request):
     if current_field not in ["project", "repo", "refresh"] and stored_state.get("repo") == selected_repo and stored_state.get("branches"):
         cached_branches = stored_state.get("branches")
 
-    state = await normalize_selection(cfg, gitlab, selected_project, selected_repo, selected_branch, selected_env, cached_branches, selected_module)
+    state = await normalize_selection(cfg, gitlab, selected_project, selected_repo, selected_branch, selected_env, cached_branches, selected_vars=selected_vars)
 
     if open_message_id:
         await save_card_state(open_message_id, state)
@@ -167,9 +181,9 @@ async def feishu_card(request: Request):
 
     # ── 去重 ───────────────────────────────────────────────────
     dedup_key = ""
-    if action_name in {"run", "refresh", "history"}:
-        dedup_key = f"{open_message_id}:{action_name}:{state['project']}:{state['repo']}:{state['branch']}:{state['env']}"
-        dedup_window = 4 if action_name == "run" else 2
+    if action_name in {"run", "refresh", "history", "review"}:
+        dedup_key = f"{open_message_id}:{action_name}:{state.get('project')}:{state.get('repo')}:{state.get('branch')}:{state.get('env')}"
+        dedup_window = 4 if action_name in {"run", "review"} else 2
         if not await check_action_dedup(dedup_key, dedup_window):
             logger.info("dedup hit key=%s", dedup_key)
             return JSONResponse({})
@@ -224,7 +238,10 @@ async def feishu_card(request: Request):
             return JSONResponse({"toast": {"type": "info", "content": f"🔐 已发起审批请求 (#{approval_id})，请等待审批人操作"}})
 
         # ── 直接触发 ────────────────────────────────────────────
-        await lock_repo(state["repo_id"])
+        if not await try_lock_repo(state["repo_id"]):
+            logger.warning("Repo %s locked during try_lock, run rejected.", state["repo_id"])
+            return JSONResponse({"toast": {"type": "error", "content": "该仓正在发布，被并发锁定，请稍后"}})
+            
         asyncio.create_task(background_run_pipeline(feishu_client, gitlab, cfg, state, open_message_id, operator_open_id, open_chat_id))
 
         card = build_card(cfg, status="执行中", state=state, latest_pipeline_text="初始化中...", latest_result_text="已接收发版指令正在投递...", show_details=True, is_locked=True)

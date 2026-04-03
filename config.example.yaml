@@ -11,6 +11,7 @@ feishu:
   verification_token: "xxxxxxxxxxxx"     # 飞书开放平台 -> 事件订阅 -> Verification Token
   encrypt_key: ""                        # 如不使用加密可留空
   allow_from: []                         # IP白名单，留空则不限制
+  audit_chat_id: ""                      # 【可选】发版通知/审计的微信/飞书群组 Chat ID（如：oc_xxxxxx）
 
 # ---- 服务监听 ----
 server:
@@ -38,22 +39,27 @@ projects:
     environments: ["test", "prod"]             # 可选环境列表
     repos:
       - name: "前端仓库"                       # 仓库显示名
-        repo: "group/frontend-repo"            # GitLab 仓库路径
         id: 1                                  # GitLab Project ID（必须准确）
+        repo: "group/frontend-repo"            # GitLab 仓库路径
+        variables:                             # 【新增】自定义环境变量注册（会自动在卡片生成下拉菜单）
+          - key: "TARGET_PROFILE"              # 注入流水线的核心变量名
+            label: "🎨 构建配置"               # 飞书卡片上显示的下拉框名字
+            options: ["app", "admin", "portal"]# 可供选择的值
+
       - name: "后端仓库"
-        repo: "group/backend-repo"
         id: 2
-        modules:                               # 【可选】微服务模块列表，配置后卡片会自动出现模块选择下拉框
-          - "service-user"                     # 模块名会作为 TARGET_MODULE 变量传递给 GitLab Pipeline
-          - "service-order"
-          - "service-gateway"
+        repo: "group/backend-repo"
+        variables:                             # 【动态变量引擎】取代了旧版硬编码的 modules
+          - key: "TARGET_MODULE"
+            label: "🧩 选微服务"
+            options: ["service-user", "service-order", "service-gateway"]
 
   - name: "示例项目B"
     environments: ["test"]
     repos:
       - name: "主仓库"
-        repo: "group/main-repo"
         id: 3
+        repo: "group/main-repo"
 
 # ---- 权限控制 ----
 # 基于飞书用户 open_id 的发版权限管理

@@ -28,7 +28,7 @@ async def normalize_selection(
     selected_branch: Optional[str] = None,
     selected_env: Optional[str] = None,
     cached_branches: Optional[list] = None,
-    selected_module: Optional[str] = None,
+    selected_vars: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     projects = cfg.get("projects", [])
     if not projects:
@@ -61,8 +61,18 @@ async def normalize_selection(
 
     branch_value = selected_branch if selected_branch in branches else branches[0]
 
-    modules = repo.get("modules", [])
-    module_value = selected_module if selected_module in modules else (modules[0] if modules else None)
+    variables_def = list(repo.get("variables", []))
+    if "modules" in repo:
+        variables_def.append({"key": "TARGET_MODULE", "label": "🧩 选微服务 (Module)", "options": repo["modules"]})
+        
+    vars_val = {}
+    selected_vars = selected_vars or {}
+    for vdef in variables_def:
+        vk = vdef["key"]
+        vopts = vdef["options"]
+        if not vopts: continue
+        val = selected_vars.get(vk) if selected_vars.get(vk) in vopts else vopts[0]
+        vars_val[vk] = val
 
     return {
         "project": project["name"],
@@ -72,8 +82,8 @@ async def normalize_selection(
         "branch": branch_value,
         "env": env_value,
         "branches": branches,
-        "modules": modules,
-        "module": module_value,
+        "variables_def": variables_def,
+        "variables": vars_val,
     }
 
 
@@ -128,8 +138,8 @@ def build_history_card(
         "branch": state["branch"],
         "env": state["env"],
     }
-    if state.get("module"):
-        action_base_val["module"] = state["module"]
+    for k, v in state.get("variables", {}).items():
+        action_base_val[f"var_{k}"] = v
 
     elements = [
         {"tag": "markdown", "content": content},
@@ -162,16 +172,33 @@ def build_approval_card(
     state: Dict[str, Any],
     requester_open_id: str,
     approval_id: str,
+    approvers: List[str] = None,
 ) -> Dict[str, Any]:
     """构建审批请求卡片"""
-    module_line = f"\n**微服务**：{state['module']}" if state.get("module") else ""
+    variables_line = ""
+    if state.get("variables"):
+        v_lines = []
+        for vdef in state.get("variables_def", []):
+            k = vdef["key"]
+            val = state["variables"].get(k)
+            label = vdef.get("label", k).split(" ", 1)[-1] if " " in vdef.get("label", k) else vdef.get("label", k)
+            v_lines.append(f"**{label}**：{val}")
+        if v_lines:
+            variables_line = "\n" + "\n".join(v_lines)
+    
+    at_approvers = ""
+    if approvers:
+        at_approvers = " ".join([f"<at id=\"{uid}\"></at>" for uid in approvers])
+        
     content = (
         f"<at id=\"{requester_open_id}\"></at> **请求发布至生产环境**\n\n"
         f"**项目**：{state['project']} - {state['repo']}\n"
         f"**分支**：{state['branch']}\n"
         f"**环境**：{state['env']}"
-        f"{module_line}"
+        f"{variables_line}"
     )
+    if at_approvers:
+        content += f"\n\n**请审批**：{at_approvers}"
 
     return {
         "config": {"wide_screen_mode": True},
@@ -194,11 +221,22 @@ def build_approval_card(
                         "type": "danger",
                         "value": {"action": "reject", "approval_id": approval_id},
                     },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "🤖 获取 AI 审查报告"},
+                        "value": {
+                            "action": "review",
+                            "project": state["project"],
+                            "repo": state["repo"],
+                            "branch": state["branch"],
+                            "env": state["env"]
+                        },
+                    },
                 ],
             },
             {
                 "tag": "note",
-                "elements": [{"tag": "plain_text", "content": "⚠️ 仅配置的审批人可操作"}],
+                "elements": [{"tag": "plain_text", "content": "⚠️ 发版前建议点击「获取 AI 审查报告」进行风险排查。仅配置的审批人可操作。"}],
             },
         ],
     }
@@ -267,8 +305,8 @@ def build_card(
         "branch": state["branch"],
         "env": state["env"]
     }
-    if state.get("module"):
-        action_base_val["module"] = state["module"]
+    for k, v in state.get("variables", {}).items():
+        action_base_val[f"var_{k}"] = v
 
     elements = [
         {
@@ -414,31 +452,34 @@ def build_card(
         }
     ]
 
-    if state.get("modules"):
-        mod_options = [{"text": {"tag": "plain_text", "content": m}, "value": m} for m in state["modules"]]
-        elements.append({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "background_style": "default",
-            "columns": [
-                {
-                    "tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
-                    "elements": [{"tag": "markdown", "content": "**🧩 选微服务 (Module)**"}]
-                },
-                {
-                    "tag": "column", "width": "weighted", "weight": 2, "vertical_align": "center",
-                    "elements": [
-                        {
-                            "tag": "select_static",
-                            "placeholder": {"tag": "plain_text", "content": state["module"]},
-                            "name": "module",
-                            "options": mod_options,
-                            "value": {**action_base_val, "current_field": "module"},
-                        }
-                    ]
-                }
-            ]
-        })
+    for vdef in state.get("variables_def", []):
+         vk = vdef["key"]
+         vlabel = vdef.get("label", f"🎛️ 变量 {vk}")
+         vopts = [{"text": {"tag": "plain_text", "content": opt}, "value": opt} for opt in vdef["options"]]
+         
+         elements.append({
+             "tag": "column_set",
+             "flex_mode": "none",
+             "background_style": "default",
+             "columns": [
+                 {
+                     "tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                     "elements": [{"tag": "markdown", "content": f"**{vlabel}**"}]
+                 },
+                 {
+                     "tag": "column", "width": "weighted", "weight": 2, "vertical_align": "center",
+                     "elements": [
+                         {
+                             "tag": "select_static",
+                             "placeholder": {"tag": "plain_text", "content": state["variables"][vk]},
+                             "name": f"var_{vk}",
+                             "options": vopts,
+                             "value": {**action_base_val, "current_field": f"var_{vk}"},
+                         }
+                     ]
+                 }
+             ]
+         })
 
     elements.append({"tag": "hr"})
 
@@ -458,6 +499,10 @@ def build_card(
                 "text": {"tag": "plain_text", "content": "✅ 执行触发 / 申请发布"},
                 "type": "primary",
                 "value": {**action_base_val, "action": "run"},
+                "confirm": {
+                    "title": {"tag": "plain_text", "content": "⚠️ 发版最终确认"},
+                    "text": {"tag": "plain_text", "content": "您即将直接触发部署流程。\n\n• 如果你已经点过 AI Review，或者确信代码无风险，请点击【确定】。\n• 如果你想先让 AI 把关，请点击【取消】，然后点击旁边的【🤖 AI Review】按钮。\n\n确定要跳过审查、直接发版吗？"}
+                }
             },
             {
                 "tag": "button",

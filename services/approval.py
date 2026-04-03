@@ -29,10 +29,19 @@ async def create_approval(feishu_client: FeishuClient, gitlab: Any, cfg: Dict[st
         "approval_message_id": None,
     }
     
-    approval_card = build_approval_card(state, operator_open_id, approval_id)
+    approval_card = build_approval_card(state, operator_open_id, approval_id, approvers=approvers)
+    
+    # 优先将审批请求发送给公共审计群组，避免私聊发版时审批人无法收到通知
+    audit_chat_id = cfg.get("feishu", {}).get("audit_chat_id")
+    target_chat_id = audit_chat_id if audit_chat_id else open_chat_id
+    
     try:
-        resp = await feishu_client.send_card(open_chat_id, approval_card)
+        resp = await feishu_client.send_card(target_chat_id, approval_card)
         record["approval_message_id"] = resp.get("data", {}).get("message_id")
+        
+        # 如果发到了群里但触发点是私聊，给触发人发送一条文字提示
+        if audit_chat_id and audit_chat_id != open_chat_id:
+            await feishu_client.send_text(open_chat_id, f"📝 已将发版审批请求（#{approval_id}）发送至发版群，请提醒对应审批人处理。")
     except Exception as e:
         logger.error("failed to send approval card: %s", e)
 
@@ -62,6 +71,10 @@ async def resolve_approval(approval_id: str, action: str, resolver_open_id: str)
     state, open_message_id, operator_open_id, open_chat_id = record["state"], record["open_message_id"], record["operator_open_id"], record["open_chat_id"]
 
     if action == "approve":
+        from core.state import try_lock_repo
+        if not await try_lock_repo(state["repo_id"]):
+            return {"ok": False, "msg": "该仓正在发布中，无法进行批准"}
+
         record["status"] = "approved"
         from services.pipeline import background_run_pipeline
         asyncio.create_task(background_run_pipeline(feishu_client, gitlab, cfg, state, open_message_id, operator_open_id, open_chat_id))

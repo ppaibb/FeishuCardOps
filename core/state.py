@@ -58,6 +58,16 @@ async def lock_repo(repo_id: int) -> None:
     await r.setex(f"repo_lock:{repo_id}", 3600, "1")
 
 
+async def try_lock_repo(repo_id: int) -> bool:
+    if not repo_id:
+        return False
+    r = get_redis()
+    success = await r.set(f"repo_lock:{repo_id}", "1", nx=True, ex=3600)
+    if success:
+        logger.info(f"try_lock_repo succeeded repo_id={repo_id}")
+    return bool(success)
+
+
 async def unlock_repo(repo_id: int) -> None:
     if not repo_id:
         return
