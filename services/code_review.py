@@ -146,55 +146,50 @@ MR：!{mr_iid} — {mr_title}
             summary_line = f"**MR**：{mr_link}　**{mr_title}**\n**方向**：`{branch}` → `{target_branch}`　|　**文件数**：{len(changes)}　|　**状态**：{mr_state}"
 
         else:
-            # ── 降级：分支对比模式 ────────────────────────────────
+            # ── 降级：最新提交模式 ────────────────────────────────
             if review_msg_id:
                 fallback_card = _build_review_card(
                     state, "🔄 AI 正在分析中...",
-                    f"<at id=\"{operator_open_id}\"></at> 未找到 MR，已降级为分支对比模式：`{branch}` vs `{default_branch}`，请稍候...",
+                    f"<at id=\"{operator_open_id}\"></at> 未找到 MR，已降级为单分支模式：正在分析 `{branch}` 的最新提交...",
                     "blue"
                 )
                 await feishu_client.update_card(review_msg_id, fallback_card)
 
-            if default_branch == branch:
-                result_card = _build_review_card(state, "⚠️ 无法对比", f"当前分支 `{branch}` 就是默认分支，没有可对比的差异。", "yellow")
+            commits = await gitlab.get_branch_commits(state["repo_id"], branch, per_page=1)
+
+            if not commits:
+                result_card = _build_review_card(state, "⚠️ 无法对比", f"分支 `{branch}` 获取不到任何提交记录。", "yellow")
                 if review_msg_id:
                     await feishu_client.update_card(review_msg_id, result_card)
                 return
 
-            compare = await gitlab.compare_branches(state["repo_id"], default_branch, branch)
-            commits = compare.get("commits", [])
-            diffs = compare.get("diffs", [])
+            latest_commit = commits[0]
+            latest_commit_sha = latest_commit.get("id", "empty")
+            
+            diffs = await gitlab.get_commit_diff(state["repo_id"], latest_commit_sha)
 
             if not diffs:
-                result_card = _build_review_card(state, "ℹ️ 无代码差异", f"`{default_branch}` → `{branch}` 之间没有代码变更。", "blue")
+                result_card = _build_review_card(state, "ℹ️ 无代码差异", f"分支 `{branch}` 的最近一次提交 `{latest_commit_sha[:8]}` 没有实质性文件变更。", "blue")
                 if review_msg_id:
                     await feishu_client.update_card(review_msg_id, result_card)
                 return
 
             diff_text = _truncate_diff(diffs)
-            commits_text = "\n".join(
-                f"- `{c.get('short_id', c.get('id', '')[:8])}` {c.get('title', '')} ({c.get('author_name', '')})"
-                for c in commits[:15]
-            )
-            if len(commits) > 15:
-                commits_text += f"\n- ... 另有 {len(commits) - 15} 个提交"
+            commits_text = f"- `{latest_commit_sha[:8]}` {latest_commit.get('title', '')} ({latest_commit.get('author_name', '')})"
 
-            latest_commit_sha = commits[0].get("id", str(len(commits))) if commits else "empty"
             cache_key = f"ai_review:repo_{state['repo_id']}:branch_{latest_commit_sha}"
-            user_message = f"""以下是即将从 `{branch}` 分支部署到 `{state['env']}` 环境的代码变更：
+            user_message = f"""以下是即将从 `{branch}` 分支部署到 `{state['env']}` 环境的最新代码变更：
 
 项目：{state['project']} / {state['repo']}
-对比：{default_branch} → {branch}
-涉及 {len(commits)} 个提交、{len(diffs)} 个文件变更
-
-### 提交记录
+分支：{branch}
+最新的提交：
 {commits_text}
 
 ### 代码差异
 {diff_text}
 
 请对以上代码变更进行 Code Review。"""
-            summary_line = f"**模式**：分支对比（无 MR）\n**对比**：`{default_branch}` → `{branch}`　|　**提交数**：{len(commits)}　|　**文件数**：{len(diffs)}"
+            summary_line = f"**模式**：当前分支最新提交（无 MR）\n**分支**：`{branch}`　|　**文件数**：{len(diffs)}"
 
         # ── 检查并发锁和缓存（使用 Redis）─────────────────────────
         redis = get_redis()

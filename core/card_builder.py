@@ -117,19 +117,34 @@ def build_history_card(
 ) -> Dict[str, Any]:
     """构建 Pipeline 历史记录卡片"""
     if not history_records:
-        content = "📭 暂无发版历史记录"
+        content = "📭 暂无该仓库的发版历史记录。"
     else:
         lines = []
+        status_map = {"success": "✅ 成功", "failed": "❌ 失败", "canceled": "⚠️ 取消", "running": "🔄 执行中"}
         for i, rec in enumerate(history_records[:15], 1):
-            status_emoji = {"success": "✅", "failed": "❌", "canceled": "⚠️", "running": "🔄"}.get(rec.get("status", ""), "⏳")
-            line = f"{i}. {status_emoji} **#{rec['pipeline_id']}** | `{rec['branch']}` → `{rec['env']}`"
-            if rec.get("module"): line += f" / `{rec['module']}`"
-            if rec.get("operator_name") and rec["operator_name"] != rec.get("operator_open_id"): line += f" | 👤 {rec['operator_name']}"
-            elif rec.get("operator_open_id"): line += f" | 👤 <at id=\"{rec['operator_open_id']}\"></at>"
-            if rec.get("triggered_at"): line += f"\n    🕐 {rec['triggered_at']}"
+            status_text = status_map.get(rec.get("status", ""), "⏳ 未知")
+            
+            operator = ""
+            if rec.get("operator_name") and rec["operator_name"] != rec.get("operator_open_id"): 
+                operator = f"👤 {rec['operator_name']}"
+            elif rec.get("operator_open_id"): 
+                operator = f"👤 <at id=\"{rec['operator_open_id']}\"></at>"
+
+            line = f"**{i}. 流水线 #{rec['pipeline_id']}**  |  {status_text}  |  {operator}\n"
+            line += f"　 🌿 分支：`{rec['branch']}`  ➡️  🚀 环境：`{rec['env']}`"
+            
+            if rec.get("module"): 
+                line += f"\n　 🧩 附加参数：`{rec['module']}`"
+                
+            time_line = ""
+            if rec.get("triggered_at"): 
+                time_line += f"{rec['triggered_at']}"
             if rec.get("finished_at"):
-                line += f" → {rec['finished_at']}"
-            lines.append(line)
+                time_line += f"  完毕于  {rec['finished_at']}"
+            if time_line:
+                line += f"\n　 🕐 调度周期：{time_line}"
+                
+            lines.append(line + "\n")
         content = "\n".join(lines)
 
     action_base_val = {

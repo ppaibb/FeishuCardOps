@@ -143,3 +143,24 @@ class GitLabClient:
                 return resp.json()
             logger.error("get_mr_changes failed status=%s body=%s", resp.status_code, resp.text[:500])
             return {}
+
+    async def get_branch_commits(self, project_id: int, branch: str, per_page: int = 1) -> List[Dict[str, Any]]:
+        """获取分支的最新提交列表"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/commits"
+        headers = {"PRIVATE-TOKEN": self.token}
+        params = {"ref_name": branch, "per_page": per_page}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 200:
+                return resp.json()
+            return []
+
+    async def get_commit_diff(self, project_id: int, sha: str) -> List[Dict[str, Any]]:
+        """获取单个提交的代码变更详情"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/commits/{sha}/diff"
+        headers = {"PRIVATE-TOKEN": self.token}
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            return []
