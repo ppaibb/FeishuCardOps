@@ -36,7 +36,7 @@ ai:
 # 支持多项目、多仓库、多环境、多微服务模块
 projects:
   - name: "示例项目A"                          # 项目名称（同时也是触发词前缀，发送"示例项目A发版"即可唤醒卡片）
-    environments: ["test", "prod"]             # 可选环境列表
+    environments: ["test", "prod"]             # 可选环境列表（注：若需在卡片显示如"本地机房"这样的中文别名，勿改此代码，请去 core/card_builder.py 的 get_env_display() 设置视图映射）
     repos:
       - name: "前端仓库"                       # 仓库显示名
         id: 1                                  # GitLab Project ID（必须准确）

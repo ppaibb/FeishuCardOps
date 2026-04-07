@@ -120,7 +120,7 @@
 | **交互卡片表单** | `card_state:{message_id}` | String | 缓存用户在卡片上的选择上下文。单卡片大小 <1KB，配备 **7天TTL有效期**。用户 7 天未操作的孤儿卡片会被自动回收。 |
 | **生产发版审批流** | `approval:{approval_id}` | String | 保存等待审批的部署详情参数。**存续期生命周期 7天**。过期防误操作自动剔除。 |
 | **发版并发防死锁** | `repo_lock:{repo_id}` | String | 原子性 `NX` 分布式锁，避免同仓库同时拉起多条破坏性流水线。程序正常结束会毫秒级主动释放 `delete`，并配备 **1小时极限兜底TTL** 以防进程崩溃导致死锁。 |
-| **防穿透与 AI 缓存** | `ai_review:...` 等 | String | 大模型分析缓存基于 Commit ID 生成特征键，避免发版重试时重复浪费 Token（**24时TTL**）；并发点击动作具备 **2-4秒TTL** 截流盾。 |
+| **防穿透与 AI 缓存** | `ai_review:...` 等 | String | 大模型分析缓存基于 Commit ID 生成特征键，避免发版重试时重复浪费 Token（**24时TTL**）；并发点击动作具备 **2-4秒TTL** 截流盾。 | 
 
 ---
 
@@ -231,6 +231,10 @@ permissions:
 | `{自定义变量KEY}`| 在配置 `variables` 节点下注册的其他变量名，如 `TARGET_PROFILE` | `app` |
 | `OPERATOR_NAME` | 触发人飞书中文姓名 | `张三` |
 | `OPERATOR_OPEN_ID` | 触发人飞书 open_id | `ou_505a3130...` |
+
+> 💡 **中文环境映射提示**：
+> 在 `config.yaml` 中，`environments` 字段（如 `test`, `prod`）会被原封不动地传递给流水线（`$ENV`）以确保 CI 脚本不报错。
+> 若期望这些纯英文标识在弹出的飞书交互卡片中显示为更直观的业务中文别名（如 `本地机房`、`阿里云`），请勿直接修改 Config！您只需前往代码文件 `core/card_builder.py`，修改其中的 `get_env_display()` 函数追加一层渲染映射即可。
 
 ---
 
