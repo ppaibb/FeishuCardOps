@@ -20,6 +20,15 @@ def status_meta(status: str, latest_result_text: str, latest_pipeline_text: str)
     return {"emoji": "🟢", "label": "就绪"}
 
 
+def get_env_display(e: str) -> str:
+    le = e.lower()
+    if le in ["test", "测试"]:
+        return "本地机房"
+    if le in ["prod", "production", "线上", "生产"]:
+        return "阿里云"
+    return f"{e}环境"
+
+
 async def normalize_selection(
     cfg: Dict[str, Any],
     gitlab_client: Optional[GitLabClient] = None,
@@ -89,20 +98,21 @@ async def normalize_selection(
 
 def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: int, p_status: str, active_job_name: str, failed_job_info: str = "", commit_info: str = "") -> Dict[str, Any]:
     commit_line = f"\n**提交**：{commit_info}" if commit_info else ""
+    env_display = get_env_display(state['env'])
     if p_status == "success":
         color = "green"
         emoji = "✅"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务已执行成功！** 🎉\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id}"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务已执行成功！** 🎉\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}\n**流水线**：#{pipeline_id}"
     elif p_status in {"failed", "canceled"}:
         color = "red"
         emoji = "❌"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务执行异常终止！**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id} [{p_status}]"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务执行异常终止！**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}\n**流水线**：#{pipeline_id} [{p_status}]"
         if failed_job_info:
             content += f"\n\n**失败点**：\n🚨 {failed_job_info}"
     else:
         color = "blue"
         emoji = "⏳"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务追踪中...**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{state['env']}\n**流水线**：#{pipeline_id}\n**当前进展**：正在跟进 {active_job_name}"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务追踪中...**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}\n**流水线**：#{pipeline_id}\n**当前进展**：正在跟进 {active_job_name}"
 
     return {
         "config": {"wide_screen_mode": True},
@@ -131,7 +141,7 @@ def build_history_card(
                 operator = f"👤 <at id=\"{rec['operator_open_id']}\"></at>"
 
             line = f"**{i}. 流水线 #{rec['pipeline_id']}**  |  {status_text}  |  {operator}\n"
-            line += f"　 🌿 分支：`{rec['branch']}`  ➡️  🚀 环境：`{rec['env']}`"
+            line += f"　 🌿 分支：`{rec['branch']}`  ➡️  🚀 环境：`{get_env_display(rec['env'])}`"
             
             if rec.get("module"): 
                 line += f"\n　 🧩 附加参数：`{rec['module']}`"
@@ -284,14 +294,6 @@ def build_card(
         {"text": {"tag": "plain_text", "content": b},"value": b}
         for b in state["branches"]
     ]
-
-    def get_env_display(e: str) -> str:
-        le = e.lower()
-        if le in ["test", "测试"]:
-            return f"{e}环境 (Test)"
-        if le in ["prod", "production", "线上", "生产"]:
-            return f"{e}环境 (Prod)"
-        return f"{e}环境"
 
     env_options_enriched = [
         {"text": {"tag": "plain_text", "content": get_env_display(e)}, "value": e}
