@@ -76,16 +76,30 @@ class GitLabClient:
     async def get_branches(self, project_id: int) -> List[str]:
         url = f"{self.base_url}/api/v4/projects/{project_id}/repository/branches"
         headers = {"PRIVATE-TOKEN": self.token}
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 200:
-                return [b["name"] for b in resp.json()][:20]
-            return ["main"]
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return [b["name"] for b in resp.json()][:20]
+                else:
+                    logger.error(f"GitLab API Error: Failed to fetch branches for project {project_id}, status={resp.status_code}, body={resp.text[:200]}")
+        except Exception as e:
+            logger.error(f"GitLab API Exception: Failed to fetch branches for project {project_id}, error={e}")
+        return ["main"]
 
     async def latest_pipeline(self, project_id: int, ref: Optional[str] = None) -> Optional[Dict[str, Any]]:
         pipelines = await self.list_pipelines(project_id=project_id, ref=ref, per_page=1)
         if isinstance(pipelines, list) and pipelines:
             return pipelines[0]
+        return None
+
+    async def get_project(self, project_id: int) -> Optional[Dict[str, Any]]:
+        url = f"{self.base_url}/api/v4/projects/{project_id}"
+        headers = {"PRIVATE-TOKEN": self.token}
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
         return None
 
     async def get_default_branch(self, project_id: int) -> str:

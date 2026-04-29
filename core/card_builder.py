@@ -267,6 +267,115 @@ def build_approval_card(
     }
 
 
+def build_project_management_card(
+    all_projects: List[Dict[str, Any]],
+    dynamic_project_names: set,
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """构建项目管理面板卡片"""
+    elements = [
+        {
+            "tag": "markdown",
+            "content": "**🗂️ 已加载的项目列表**\n在此管理系统中注册的所有发版项目。"
+        },
+        {"tag": "hr"}
+    ]
+    
+    action_base_val = {
+        "project": state.get("project", ""),
+        "repo": state.get("repo", ""),
+        "branch": state.get("branch", ""),
+        "env": state.get("env", ""),
+    }
+
+    if not all_projects:
+        elements.append({
+            "tag": "markdown",
+            "content": "暂无任何项目配置。"
+        })
+    else:
+        for p in all_projects:
+            p_name = p["name"]
+            repos_str = ", ".join([r["name"] for r in p.get("repos", [])])
+            envs_str = ", ".join(p.get("environments", []))
+            
+            is_dynamic = p_name in dynamic_project_names
+            
+            if is_dynamic:
+                # 动态项目，提供删除按钮
+                elements.append({
+                    "tag": "column_set",
+                    "flex_mode": "none",
+                    "background_style": "default",
+                    "columns": [
+                        {
+                            "tag": "column", "width": "weighted", "weight": 4, "vertical_align": "center",
+                            "elements": [
+                                {
+                                    "tag": "markdown", 
+                                    "content": f"**{p_name}** `[动态配置]`\n环境: {envs_str} | 仓库: {repos_str}"
+                                }
+                            ]
+                        },
+                        {
+                            "tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+                            "elements": [
+                                {
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": "🗑️ 移除"},
+                                    "type": "danger",
+                                    "value": {**action_base_val, "action": "delete_project", "delete_name": p_name},
+                                    "confirm": {
+                                        "title": {"tag": "plain_text", "content": "确认删除"},
+                                        "text": {"tag": "plain_text", "content": f"您确定要彻底删除动态项目【{p_name}】吗？删除后将无法在此操作其对应的仓库发版。"}
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                })
+            else:
+                # 静态配置，不可删除
+                elements.append({
+                    "tag": "markdown",
+                    "content": f"**{p_name}** `[🔒静态配置(不可从卡片删除)]`\n环境: {envs_str} | 仓库: {repos_str}"
+                })
+            
+            elements.append({"tag": "hr"})
+
+    elements.append({
+        "tag": "note",
+        "elements": [
+            {
+                "tag": "plain_text",
+                "content": "💡 提示：如需新增项目，请在群内直接发送文字：\n「@机器人 帮我加一个名叫XXX的项目，测试环境和生产环境，仓库叫后端服务，GitLab ID是123」"
+            }
+        ]
+    })
+    
+    elements.append({
+        "tag": "action",
+        "actions": [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "◀️ 返回控制台"},
+                "value": {**action_base_val, "action": "refresh"},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "📤 导出动态配置 (YAML)"},
+                "value": {**action_base_val, "action": "export_yaml"},
+            }
+        ]
+    })
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "purple", "title": {"tag": "plain_text", "content": "⚙️ 卡片管理员 - 项目管理"}},
+        "elements": elements,
+    }
+
+
 def build_card(
     cfg: Dict[str, Any], status: str, state: Dict[str, Any], latest_pipeline_text: Optional[str] = None,
     latest_result_text: Optional[str] = None, show_details: bool = False, is_locked: bool = False,
@@ -530,6 +639,11 @@ def build_card(
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": "📋 历史记录"},
                 "value": {**action_base_val, "action": "history"},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "⚙️ 项目管理"},
+                "value": {**action_base_val, "action": "manage_projects"},
             },
         ]
 

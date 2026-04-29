@@ -100,3 +100,16 @@ def check_approval_required(cfg: Dict[str, Any], project: str, env: str) -> Opti
             if approvers:
                 return approvers
     return None
+
+
+def is_admin(cfg: Dict[str, Any], operator_open_id: str) -> bool:
+    """
+    检查当前操作人是否是卡片管理员。
+    管理员才能在卡片中执行项目管理等特殊操作。
+    """
+    permissions = cfg.get("permissions")
+    if not permissions:
+        return False
+        
+    admin_users = permissions.get("admin_users", [])
+    return operator_open_id in admin_users

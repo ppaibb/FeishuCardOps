@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM docker.1panel.live/library/python:3.10-slim
 
 LABEL maintainer="DevOps Team"
 LABEL description="飞书 GitLab 智能发版控制台"

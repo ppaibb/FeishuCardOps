@@ -9,6 +9,7 @@ import logging
 from fastapi import FastAPI
 
 from core.config import load_config
+from services.project_manager import get_all_projects
 from routes.card import router as card_router
 from routes.event import router as event_router
 
@@ -26,10 +27,11 @@ app.include_router(card_router)
 @app.get("/")
 async def health():
     cfg = load_config()
+    all_projects = await get_all_projects()
     return {
         "ok": True,
         "service": "feishu-gitlab-card-http",
-        "projects": [p.get("name") for p in cfg.get("projects", [])],
+        "projects": [p.get("name") for p in all_projects],
     }
 
 

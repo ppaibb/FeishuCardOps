@@ -51,7 +51,7 @@ async def poll_pipeline_status(
     open_message_id: str = "",
 ) -> None:
     final_status = "unknown"
-    for i in range(120):  # poll up to 10 minutes
+    for i in range(720):  # poll up to 60 minutes (720 * 5s = 3600s)
         await asyncio.sleep(5)
         try:
             pipeline = await gitlab_client.get_pipeline(project_id, pipeline_id)
@@ -115,16 +115,19 @@ async def poll_pipeline_status(
         await unlock_repo(repo_id)
 
     try:
+        final_status_text = "就绪" if final_status == "success" else ("异常" if final_status in {"failed", "canceled"} else "处理中")
         unlocked_card = build_card(
             cfg,
-            status="就绪",
+            status=final_status_text,
             state=state,
-            latest_pipeline_text="暂无",
-            latest_result_text="上一任务已结束，锁已释放",
+            latest_pipeline_text=f"#{pipeline_id} / {final_status}",
+            latest_result_text=f"最近 Pipeline #{pipeline_id} 状态: {final_status}",
             show_details=True,
         )
         if open_message_id:
-            await feishu_client.update_card(open_message_id, unlocked_card)
+            # 兼容旧并发卡片更新问题：获取新的 ver，推入延迟队列进行更新以防被冲掉
+            ver = next_card_version(open_message_id)
+            asyncio.create_task(delayed_update_card(feishu_client, open_message_id, unlocked_card, 0.5, version=ver))
     except Exception as e:
         logger.error("failed to unlock master card %s", e)
 

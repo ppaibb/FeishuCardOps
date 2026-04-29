@@ -24,7 +24,7 @@ gitlab:
   access_token: "glpat-xxxxxxxxxxxx"           # GitLab Personal Access Token (需要 api 权限)
 # ---- Redis 存储配置 ----
 redis:
-  url: "redis://localhost:6379/0"             # 连接 URL (格式: redis://[:password]@host:port/db)
+  url: "redis://redis:6379/0"             # 连接 URL (格式: redis://[:password]@host:port/db)
 
 # ---- AI Code Review 配置 ----
 ai:
@@ -66,6 +66,10 @@ projects:
 # 不配置此节则所有用户均可操作（向后兼容）
 permissions:
   default_policy: "allow"                      # 全局默认策略：allow (允许) / deny (拒绝)
+
+  # 卡片管理员（可使用卡片上的“项目管理”等高级功能）
+  admin_users:
+    - "ou_xxxx_admin"
 
   # 权限规则列表（从后往前匹配，最后一条匹配的规则优先）
   rules:

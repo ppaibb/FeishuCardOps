@@ -7,11 +7,13 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from core.card_builder import build_card, build_history_card, normalize_selection
+from core.card_builder import build_card, build_history_card, build_project_management_card, normalize_selection
+from services.project_manager import get_all_projects, get_dynamic_project_names, DYNAMIC_PROJECTS_KEY
 from core.config import load_config
 from core.feishu_client import FeishuClient
 from core.gitlab_client import GitLabClient
-from core.permissions import check_approval_required, check_permission
+from core.permissions import check_approval_required, check_permission, is_admin
+from core.redis_client import get_redis
 from core.state import (
     check_action_dedup,
     get_card_state,
@@ -61,6 +63,7 @@ async def feishu_card(request: Request):
         return None
 
     cfg = load_config()
+    cfg["projects"] = await get_all_projects()
     context = event.get("context", {}) or {}
     open_message_id = context.get("open_message_id") or ""
     open_chat_id = context.get("open_chat_id") or context.get("chat_id") or ""
@@ -150,7 +153,7 @@ async def feishu_card(request: Request):
             selected_env = option
         elif current_field and current_field.startswith("var_") and option:
             selected_vars[current_field[4:]] = option
-    elif action_name in {"run", "refresh", "history"} and stored_state:
+    elif action_name in {"run", "refresh", "history", "manage_projects", "delete_project"} and stored_state:
         selected_project = stored_state.get("project")
         selected_repo = stored_state.get("repo")
         selected_branch = stored_state.get("branch")
@@ -181,7 +184,7 @@ async def feishu_card(request: Request):
 
     # ── 去重 ───────────────────────────────────────────────────
     dedup_key = ""
-    if action_name in {"run", "refresh", "history", "review"}:
+    if action_name in {"run", "refresh", "history", "review", "manage_projects", "delete_project"}:
         dedup_key = f"{open_message_id}:{action_name}:{state.get('project')}:{state.get('repo')}:{state.get('branch')}:{state.get('env')}"
         dedup_window = 4 if action_name in {"run", "review"} else 2
         if not await check_action_dedup(dedup_key, dedup_window):
@@ -206,6 +209,60 @@ async def feishu_card(request: Request):
         if open_message_id:
             asyncio.create_task(delayed_update_card(feishu_client, open_message_id, history_card, 0.05))
         return JSONResponse({})
+
+    # ── 项目管理 ─────────────────────────────────────────────────
+    if action_name == "manage_projects":
+        if not is_admin(cfg, operator_open_id):
+            return JSONResponse({"toast": {"type": "error", "content": "权限不足：您不是卡片管理员"}})
+            
+        all_projects = await get_all_projects()
+        dynamic_names = await get_dynamic_project_names()
+        pm_card = build_project_management_card(all_projects, dynamic_names, state)
+        if open_message_id:
+            asyncio.create_task(delayed_update_card(feishu_client, open_message_id, pm_card, 0.05))
+        return JSONResponse({})
+
+    # ── 移除项目 ─────────────────────────────────────────────────
+    if action_name == "delete_project":
+        if not is_admin(cfg, operator_open_id):
+            return JSONResponse({"toast": {"type": "error", "content": "权限不足：您不是卡片管理员"}})
+        
+        delete_name = raw_value.get("delete_name")
+        redis = get_redis()
+        if redis and delete_name:
+            await redis.hdel(DYNAMIC_PROJECTS_KEY, delete_name)
+            
+        # 刷新项目管理卡片
+        all_projects = await get_all_projects()
+        dynamic_names = await get_dynamic_project_names()
+        pm_card = build_project_management_card(all_projects, dynamic_names, state)
+        if open_message_id:
+            asyncio.create_task(delayed_update_card(feishu_client, open_message_id, pm_card, 0.05))
+        return JSONResponse({"toast": {"type": "success", "content": f"已成功移除项目 {delete_name}"}})
+
+    # ── 导出动态项目 ─────────────────────────────────────────────────
+    if action_name == "export_yaml":
+        if not is_admin(cfg, operator_open_id):
+            return JSONResponse({"toast": {"type": "error", "content": "权限不足：您不是卡片管理员"}})
+            
+        dynamic_names = await get_dynamic_project_names()
+        all_projects = await get_all_projects()
+        
+        dyn_projects_data = [p for p in all_projects if p.get("name") in dynamic_names]
+        
+        if not dyn_projects_data:
+            return JSONResponse({"toast": {"type": "info", "content": "当前没有任何动态项目可以导出哦"}})
+            
+        import yaml
+        export_data = {"projects": dyn_projects_data}
+        yaml_str = yaml.dump(export_data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        
+        msg_content = f"👇 **动态配置已导出**\n你可以将其直接复制并追加到 `config.yaml` 的末尾（注意缩进对齐）：\n\n```yaml\n{yaml_str}```\n\n💡 固化到配置后，记得在管理面板里将动态配置彻底删除哦。"
+        
+        if open_chat_id:
+            asyncio.create_task(feishu_client.send_text(open_chat_id, msg_content))
+            
+        return JSONResponse({"toast": {"type": "success", "content": "导出成功，已通过聊天发送给你！"}})
 
     # ── AI Code Review ────────────────────────────────────────────
     if action_name == "review":

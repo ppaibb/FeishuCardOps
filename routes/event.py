@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from core.card_builder import build_card, normalize_selection
+from services.project_manager import get_all_projects, parse_and_add_project, delete_project
 from core.config import load_config
 from core.feishu_client import FeishuClient
 from core.gitlab_client import GitLabClient
@@ -19,8 +20,21 @@ router = APIRouter()
 async def process_text_message(text: str, chat_id: str):
     """后台异步处理文本并发送卡片，防止阻塞"""
     try:
+        cfg = load_config()
+        feishu = FeishuClient(cfg["feishu"]["app_id"], cfg["feishu"]["app_secret"])
+        
+        if any(keyword in text for keyword in ["添加项目", "注册项目", "新加项目", "新增项目", "加一个项目"]):
+            reply_txt = await parse_and_add_project(text)
+            await feishu.send_text(chat_id, reply_txt)
+            return
+            
+        if "删除项目" in text:
+            reply_txt = await delete_project(text)
+            await feishu.send_text(chat_id, reply_txt)
+            return
+
         if "发版" in text or "发布" in text:
-            cfg = load_config()
+            cfg["projects"] = await get_all_projects()
             gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
             
             # 从用户消息中尝试匹配项目名称
