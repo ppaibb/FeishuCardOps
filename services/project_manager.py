@@ -7,6 +7,7 @@ import anthropic
 from core.config import load_config
 from core.redis_client import get_redis
 from core.gitlab_client import GitLabClient
+from core.metrics import PROJECT_REGISTERED
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
@@ -146,6 +147,7 @@ async def parse_and_add_project(text: str) -> str:
             return "❌ Redis 连接不可用，无法保存。"
             
         await redis.hset(DYNAMIC_PROJECTS_KEY, p_name, json.dumps(project_data, ensure_ascii=False))
+        PROJECT_REGISTERED.inc()
         
         return f"✅ **添加成功！**\n项目名称: {p_name}\n包含环境: {','.join(project_data.get('environments', []))}\n仓库名: {test_repo.get('name')} (ID: {test_id})\n已经生效，快试试对我说「{p_name} 发版」 吧！"
 

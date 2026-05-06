@@ -25,6 +25,10 @@ from core.state import (
 from services.approval import create_approval, get_approval, resolve_approval
 from services.history import get_history
 from services.pipeline import background_run_pipeline, delayed_update_card, next_card_version
+from core.metrics import (
+    CARD_INTERACTION, APPROVAL_RESOLVED, PIPELINE_TRIGGERED,
+    AI_REVIEW_TRIGGERED, PROJECT_DELETED, APPROVAL_TRIGGERED, ACTIVE_LOCKS,
+)
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
@@ -100,6 +104,10 @@ async def feishu_card(request: Request):
     current_field = raw_value.get("current_field") if isinstance(raw_value, dict) else None
     option = action.get("option") if isinstance(action.get("option"), str) else None
 
+    # ── 指标：记录所有卡片交互 ─────────────────────────────────
+    if action_name:
+        CARD_INTERACTION.labels(action=action_name).inc()
+
     # ── 审批流处理 ──────────────────────────────────────────────
     if action_name in {"approve", "reject"}:
         approval_id = raw_value.get("approval_id") if isinstance(raw_value, dict) else None
@@ -112,6 +120,7 @@ async def feishu_card(request: Request):
             logger.info("dedup hit approval %s by %s", approval_id, operator_open_id)
             return JSONResponse({"toast": {"type": "info", "content": "处理中，请稍候"}})
             
+        APPROVAL_RESOLVED.labels(action=action_name).inc()
         result = await resolve_approval(approval_id, action_name, operator_open_id)
         toast_type = "success" if result["ok"] else "error"
         return JSONResponse({"toast": {"type": toast_type, "content": result["msg"]}})
@@ -231,6 +240,7 @@ async def feishu_card(request: Request):
         redis = get_redis()
         if redis and delete_name:
             await redis.hdel(DYNAMIC_PROJECTS_KEY, delete_name)
+            PROJECT_DELETED.inc()
             
         # 刷新项目管理卡片
         all_projects = await get_all_projects()
@@ -267,6 +277,7 @@ async def feishu_card(request: Request):
     # ── AI Code Review ────────────────────────────────────────────
     if action_name == "review":
         from services.code_review import run_code_review
+        AI_REVIEW_TRIGGERED.labels(project=state["project"], repo=state["repo"]).inc()
         asyncio.create_task(run_code_review(feishu_client, gitlab, state, open_chat_id, operator_open_id))
         return JSONResponse({"toast": {"type": "info", "content": "🤖 AI 正在审查代码，结果稍后发送到群聊..."}})
 
@@ -288,6 +299,7 @@ async def feishu_card(request: Request):
         # ── 审批检查 ────────────────────────────────────────────
         approvers = check_approval_required(cfg, state["project"], state["env"])
         if approvers:
+            APPROVAL_TRIGGERED.labels(project=state["project"], env=state["env"]).inc()
             approval_id = await create_approval(
                 feishu_client, gitlab, cfg, state,
                 open_message_id, operator_open_id, open_chat_id, approvers,
@@ -298,7 +310,9 @@ async def feishu_card(request: Request):
         if not await try_lock_repo(state["repo_id"]):
             logger.warning("Repo %s locked during try_lock, run rejected.", state["repo_id"])
             return JSONResponse({"toast": {"type": "error", "content": "该仓正在发布，被并发锁定，请稍后"}})
-            
+
+        PIPELINE_TRIGGERED.labels(project=state["project"], repo=state["repo"], env=state["env"]).inc()
+        ACTIVE_LOCKS.inc()
         asyncio.create_task(background_run_pipeline(feishu_client, gitlab, cfg, state, open_message_id, operator_open_id, open_chat_id))
 
         card = build_card(cfg, status="执行中", state=state, latest_pipeline_text="初始化中...", latest_result_text="已接收发版指令正在投递...", show_details=True, is_locked=True)

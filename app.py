@@ -7,11 +7,15 @@ FeishuCardOps — 飞书卡片驱动的 GitLab CI/CD 智能发版控制台
 import logging
 
 from fastapi import FastAPI
+from prometheus_client import make_asgi_app
 
 from core.config import load_config
 from services.project_manager import get_all_projects
 from routes.card import router as card_router
 from routes.event import router as event_router
+
+# 确保指标模块在应用启动时初始化
+import core.metrics  # noqa: F401
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +26,10 @@ app = FastAPI(title="feishu-gitlab-card-http")
 
 app.include_router(event_router)
 app.include_router(card_router)
+
+# 挂载 Prometheus /metrics 端点
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
 
 
 @app.get("/")

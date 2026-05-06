@@ -1,0 +1,123 @@
+feishu:
+  allow_from: []
+  app_id: cli_a936a9e2a6215bd3
+  app_secret: J6wEYJa5JO9LvStQoLlhgd01Dhvwk1Ul
+  encrypt_key: ''
+  verification_token: gYpg5YW9AXVAue1WoGcUfbDKuTod32Gn
+  audit_chat_id: "oc_c00d662d8160d0f534d9e1510b60813b"
+gitlab:
+  access_token: glpat-hq-4-xqSPqL3Vkeg-defEm86MQp1OjEH.01.0w0rqzeso
+  base_url: http://192.168.3.222:30080
+permissions:
+  admin_users:
+    - ou_ae64cdd56c4af59d3c82eb87b596b43b
+    - ou_505a31305c66e145dcc1b2d514561e4d    # 卡片管理员id
+  approval_required:
+  - approvers:
+    - ou_505a31305c66e145dcc1b2d514561e4d
+    - ou_approver2xxxxxxxxxxxx
+    env: prod
+    project: '*'
+  default_policy: allow
+  rules:
+  - env: test
+    policy: allow
+    project: '*'
+  - allow_users:
+    - ou_505a31305c66e145dcc1b2d514561e4d 
+    - ou_yyyyyyyyyyyyyyyy
+    env: prod
+    policy: deny
+    project: '*'
+projects:
+  - name: 全飞云
+    environments:
+      - test
+      - prod
+    repos:
+      - name: 非合作目标
+        id: 15
+        repo: standard-product-group/realtime-service-non-cooperative
+      - name: 实时计算
+        id: 13
+        repo: qfy_workgroup/realtime-service
+      - name: 后端仓库
+        id: 10
+        repo: gqfy_workgroup/qfy-cloud
+        variables:
+          - key: "TARGET_MODULE"
+            label: "🧩 选服务"
+            options: ["snowy-single-app", "snowy-web-app", "service-gateway"]
+      - name: 前端
+        id: 8
+        repo: airspace-approval/ui
+        variables:
+          - key: "TARGET_PROFILE"
+            label: "🎨 构建配置"
+            options: ["pro", "gk"]
+  - name: 空域审批
+    environments:
+      - test
+    repos:
+      - name: 后端
+        id: 6
+        repo: airspace-approval/backend
+        variables:
+          - key: "TARGET_MODULE"
+            label: "🧩 选服务"
+            options: ["snowy-single-app"]
+      - name: 前端
+        id: 8
+        repo: airspace-approval/ui
+        variables:
+          - key: "TARGET_PROFILE"
+            label: "🎨 构建配置"
+            options: ["pro", "gk"]
+      - name: 实时计算
+        id: 7
+        repo: airspace-approval/realtime-service
+  - name: 基础框架
+    environments:
+      - test
+    repos:
+      - name: 前端
+        id: 18
+        repo: x-space/baseline/baseline-ui
+        variables:
+          - key: "TARGET_PROFILE"
+            label: "🎨 构建配置"
+            options: ["pro", "gk"]
+      - name: 后端
+        id: 19
+        repo: x-space/baseline/baseline-backend
+        variables:
+          - key: "TARGET_MODULE"
+            label: "🧩 选服务"
+            options: ["base-actuator", "base-sentinel", "base-gateway", "base-job", "base-web", "base-biz", "base-workflow", "base-single"]
+      - name: 工作流
+        id: 20
+        repo: x-space/baseline/baseline-flowable-modeler-app
+  - name: 邮政
+    environments:
+      - test
+    repos:
+      - name: 前端
+        id: 2
+        repo: chinapost/2024-new-project/appeal-ui
+      - name: 后端
+        id: 3
+        repo: chinapost/2024-new-project/appeal-service
+        variables:
+          - key: "TARGET_MODULE"
+            label: "🧩 选服务"
+            options: ["yz-actuator", "yz-sentinel", "yz-gateway", "yz-job", "yz-web", "yz-biz", "yz-third"]
+
+redis:
+  url: redis://redis:6379/0
+ai:
+  api_key: 'sk-cp-2UNyzaV97ih8a3CiZ12XqkMSi3zQKngblTeN8K4Z5RKFxpKCW4sEdsiv0iEagKkX-K7eVBpSfUp0JkSakDLo3unbU0Yrp_sjGfdyGbVny064PM5e6hh1FpE'
+  base_url: 'https://api.minimaxi.com/anthropic'
+  model: 'MiniMax-M2.7'
+server:
+  bind_host: 0.0.0.0
+  bind_port: 55000
