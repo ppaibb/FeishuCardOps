@@ -4,3 +4,7 @@ config.yaml
 __pycache__/
 *.pyc
 .env
+
+config.yaml
+config-prod.yaml
+config.example.yaml

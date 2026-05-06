@@ -7,6 +7,7 @@ from core.card_builder import build_card, build_sub_card
 from core.feishu_client import FeishuClient
 from core.gitlab_client import GitLabClient
 from core.state import unlock_repo
+from core.metrics import PIPELINE_COMPLETED, PIPELINE_DURATION, AI_DIAGNOSIS_TRIGGERED, ACTIVE_LOCKS
 from services.history import add_record, update_record_status
 
 logger = logging.getLogger("feishu_gitlab_card_http")
@@ -51,6 +52,7 @@ async def poll_pipeline_status(
     open_message_id: str = "",
 ) -> None:
     final_status = "unknown"
+    start_time = asyncio.get_event_loop().time()
     for i in range(720):  # poll up to 60 minutes (720 * 5s = 3600s)
         await asyncio.sleep(5)
         try:
@@ -82,6 +84,7 @@ async def poll_pipeline_status(
                     if trace:
                         trace_tail = trace[-3000:]
                         from services.code_review import diagnose_job_log
+                        AI_DIAGNOSIS_TRIGGERED.labels(project=state.get("project", ""), repo=state.get("repo", "")).inc()
                         ai_cause = await diagnose_job_log(cfg, fj_name, trace_tail)
                         failed_job_info += f"\n\n**🤖 AI 故障诊断**：{ai_cause}"
 
@@ -108,11 +111,23 @@ async def poll_pipeline_status(
         except Exception as e:
             logger.error("poll pipeline error %s", e)
 
-    # 更新历史记录状态
+    # 更新历史记录状态及释放锁
     repo_id = state.get("repo_id")
     if repo_id:
         await update_record_status(repo_id, pipeline_id, final_status)
         await unlock_repo(repo_id)
+
+    # ── 指标：记录发版结果与耗时 ─────────────────────────
+    elapsed = asyncio.get_event_loop().time() - start_time
+    PIPELINE_COMPLETED.labels(
+        project=state.get("project", ""), repo=state.get("repo", ""),
+        env=state.get("env", ""), status=final_status,
+    ).inc()
+    PIPELINE_DURATION.labels(
+        project=state.get("project", ""), repo=state.get("repo", ""),
+        env=state.get("env", ""),
+    ).observe(elapsed)
+    ACTIVE_LOCKS.dec()
 
     try:
         final_status_text = "就绪" if final_status == "success" else ("异常" if final_status in {"failed", "canceled"} else "处理中")

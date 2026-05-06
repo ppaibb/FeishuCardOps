@@ -14,6 +14,7 @@ from core.config import load_config
 from core.feishu_client import FeishuClient
 from core.gitlab_client import GitLabClient
 from core.redis_client import get_redis
+from core.metrics import AI_REVIEW_CACHED
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
@@ -209,6 +210,7 @@ MR：!{mr_iid} — {mr_title}
             if cached_review:
                 review_text = cached_review
                 summary_line += " ⚡ *(已缓存)*"
+                AI_REVIEW_CACHED.labels(project=state.get("project", ""), repo=state.get("repo", "")).inc()
             else:
                 # ── 调用 AI（MR 和分支对比共用）─────────────────────────
                 client = anthropic.AsyncAnthropic(api_key=api_key, base_url=base_url)

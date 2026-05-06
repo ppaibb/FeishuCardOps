@@ -63,6 +63,9 @@
 | 👤 **飞书实名解析** | 自动调用通讯录 API 将 open_id 解析为中文姓名（7天缓存） |
 | 🤖 **AI Code Review** | 发版前一键 AI 代码审查，自动获取 MR/分支变更并根据固定专业模板生成排版精美的风控报告 |
 | 🤖 **AI 故障诊断** | 流水线发生异常时，自动回溯抓取 GitLab 报错 Trace（尾端3000字符），调用大模型解析报错根因及修复建议 |
+| 🤖 **AI 项目注册** | 支持自然语言对话直接向系统注册微服务发版配置，Agent 自动检验 GitLab 连通性并写入持久化 |
+| 📤 **动态配置导出** | 在管理员面板一键将 AI 注册的动态项目导出为标准 YAML 文本推送至对话，实现平滑的 GitOps 静态固化 |
+| 📊 **Prometheus 指标** | 内置 `/metrics` 端点暴露发版次数、耗时、AI Review 触发率、审批流等运维指标，原生对接 Grafana 大盘 |
 
 ---
 
@@ -120,7 +123,8 @@
 | **交互卡片表单** | `card_state:{message_id}` | String | 缓存用户在卡片上的选择上下文。单卡片大小 <1KB，配备 **7天TTL有效期**。用户 7 天未操作的孤儿卡片会被自动回收。 |
 | **生产发版审批流** | `approval:{approval_id}` | String | 保存等待审批的部署详情参数。**存续期生命周期 7天**。过期防误操作自动剔除。 |
 | **发版并发防死锁** | `repo_lock:{repo_id}` | String | 原子性 `NX` 分布式锁，避免同仓库同时拉起多条破坏性流水线。程序正常结束会毫秒级主动释放 `delete`，并配备 **1小时极限兜底TTL** 以防进程崩溃导致死锁。 |
-| **防穿透与 AI 缓存** | `ai_review:...` 等 | String | 大模型分析缓存基于 Commit ID 生成特征键，避免发版重试时重复浪费 Token（**24时TTL**）；并发点击动作具备 **2-4秒TTL** 截流盾。 | 
+| **防穿透与 AI 缓存** | `ai_review:...` 等 | String | 大模型分析缓存基于 Commit ID 生成特征键，避免发版重试时重复浪费 Token（**24时TTL**）；并发点击动作具备 **2-4秒TTL** 截流盾。 |
+| **动态项目配置** | `cardops:dynamic_projects` | Hash | 存放通过 AI 会话临时添加到系统里的工程配置，可于管理面板随时剔除或一键导出为静态 YAML。 |
 
 ---
 
@@ -304,6 +308,7 @@ FeishuCardOps/
 │   ├── gitlab_client.py       # GitLab API 客户端（全异步）
 │   ├── card_builder.py        # 卡片构建器（主卡/副卡/历史/审批）
 │   ├── permissions.py         # RBAC 权限控制
+│   ├── metrics.py             # Prometheus 指标定义（发版/AI/审批/交互）
 │   └── state.py               # Redis 状态管理（锁/去重/卡片状态）
 ├── routes/                    # 路由处理
 │   ├── card.py                # 卡片回调路由（含权限/审批/历史）
@@ -311,7 +316,9 @@ FeishuCardOps/
 ├── services/                  # 业务服务
 │   ├── pipeline.py            # 流水线触发与轮询（全异步 + Commit 追踪）
 │   ├── history.py             # 发版历史记录（Redis 持久化，100条/仓库）
-│   └── approval.py            # 审批流管理（Redis 持久化，7天有效）
+│   ├── approval.py            # 审批流管理（Redis 持久化，7天有效）
+│   ├── project_manager.py     # AI 动态项目注册与管理
+│   └── code_review.py         # AI Code Review 与故障诊断
 ├── config.yaml                # 运行时配置（⚠️ 含敏感信息，勿提交 Git）
 ├── config.example.yaml        # 配置模板（含 Redis/权限/审批示例）
 ├── requirements.txt           # Python 依赖
@@ -319,6 +326,79 @@ FeishuCardOps/
 ├── docker-compose.yml         # Docker Compose 编排
 └── README.md                  # 本文档
 ```
+
+---
+
+## 📊 Prometheus 监控指标
+
+服务启动后，访问 `http://你的服务器:55000/metrics` 即可获取 Prometheus 标准格式的指标数据。
+
+### 指标清单
+
+#### 🚀 发版核心指标
+
+| 指标名 | 类型 | 标签 | 说明 |
+|--------|------|------|------|
+| `feishu_pipeline_triggered_total` | Counter | project, repo, env | 发版触发总次数 |
+| `feishu_pipeline_completed_total` | Counter | project, repo, env, status | 发版完成次数（按最终状态：success / failed / canceled） |
+| `feishu_pipeline_duration_seconds` | Histogram | project, repo, env | 发版耗时分布（桶：30s / 60s / 120s / 300s / 600s / 1800s / 3600s） |
+| `feishu_active_pipeline_locks` | Gauge | — | 当前正在执行中的发版任务数 |
+
+#### 🤖 AI 相关指标
+
+| 指标名 | 类型 | 标签 | 说明 |
+|--------|------|------|------|
+| `feishu_ai_review_triggered_total` | Counter | project, repo | AI Code Review 触发总次数 |
+| `feishu_ai_review_cache_hit_total` | Counter | project, repo | AI Review 命中缓存次数（节省 Token 开销） |
+| `feishu_ai_diagnosis_triggered_total` | Counter | project, repo | AI 故障诊断触发总次数 |
+
+#### 🔐 审批流指标
+
+| 指标名 | 类型 | 标签 | 说明 |
+|--------|------|------|------|
+| `feishu_approval_triggered_total` | Counter | project, env | 审批流发起次数 |
+| `feishu_approval_resolved_total` | Counter | action (approve / reject) | 审批处理次数（按操作类型） |
+
+#### 🎯 卡片交互与项目管理
+
+| 指标名 | 类型 | 标签 | 说明 |
+|--------|------|------|------|
+| `feishu_card_interaction_total` | Counter | action | 飞书卡片交互事件总次数（按 action 分类） |
+| `feishu_project_registered_total` | Counter | — | 通过 AI 动态注册的项目总次数 |
+| `feishu_project_deleted_total` | Counter | — | 动态项目被删除的总次数 |
+
+### 埋点位置速查
+
+| 文件 | 埋点内容 |
+|------|---------|
+| `routes/card.py` | 所有卡片交互 action、审批处理、发版触发、AI Review 触发、项目删除 |
+| `services/pipeline.py` | 发版完成状态与耗时、活跃锁释放、AI 故障诊断触发 |
+| `services/code_review.py` | AI Review 缓存命中 |
+| `services/project_manager.py` | AI 动态项目注册 |
+
+### Prometheus 抓取配置
+
+在 `prometheus.yml` 中添加以下配置即可开始采集：
+
+```yaml
+scrape_configs:
+  - job_name: 'feishu-cardops'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['你的服务器IP:55000']
+```
+
+### Grafana 推荐面板 PromQL
+
+| 面板用途 | PromQL 表达式 |
+|---------|--------------|
+| 每小时发版频率 | `rate(feishu_pipeline_triggered_total[1h])` |
+| 发版成功率 | `sum(feishu_pipeline_completed_total{status="success"}) / sum(feishu_pipeline_completed_total)` |
+| 平均发版耗时 | `rate(feishu_pipeline_duration_seconds_sum[1h]) / rate(feishu_pipeline_duration_seconds_count[1h])` |
+| 每日 AI Review 触发量 | `increase(feishu_ai_review_triggered_total[1d])` |
+| AI Token 节省率 | `sum(feishu_ai_review_cache_hit_total) / sum(feishu_ai_review_triggered_total)` |
+| 当前活跃发版数 | `feishu_active_pipeline_locks` |
+| 各 action 交互热力 | `topk(10, sum by (action)(rate(feishu_card_interaction_total[1h])))` |
 
 ---
 
@@ -354,11 +434,14 @@ FeishuCardOps/
 - [x] ~~🎛️ 动态泛型参数：废弃硬编码 modules 逻辑，支持所有仓库基于 Config 动态注册流水线交互参数 `$VARIABLE`。~~
 - [x] ~~📢 审计群组同步：支持配置双开群发布，关键变动 `@` 有关负责人，满足企业合规审计。~~
 - [x] ~~🔗 提交人画像扩展：发版进度追踪时深度挖掘 Commit SHA 补齐最新提交的具体名称（Title）与作者（AuthorName）。~~
+- [x] ~~🤖 AI 动态项目注册：支持通过纯自然语言一键生成、检验并入网微服务配置。~~
+- [x] ~~📤 配置管理与固化（Export YAML）：内置管理员控制面板以进行动态项目的移除与导出合并。~~
+- [x] ~~📊 Prometheus 指标大盘：内置 `/metrics` 端点，暴露发版次数/耗时/AI 触发率/审批流等全维度 DevOps 指标，原生对接 Grafana 可视化。~~
 
-### 第四阶段（TODO）
-1. [ ] ⏰ **预约延时发版**：通过卡片自带的日期控件（Picker_datetime），将任务置入后台 ZSET 由守护进程完成定时发版。
-1. [ ] 📈 **运维指标监控 (Prometheus + Grafana)**：暴露 `/metrics` 接口，展示发版效率和成功率大盘指标
-2. [ ] ⏪ **“救命级”的一键回滚功能**：在历史记录卡片中为成功的版本提供「一键回滚」操作支持
+### 第四阶段（TODO & 演进方向）
+1. [ ] ⏰ **预约延时发版**：通过飞书卡片自带的日期控件（Picker_datetime），将部署任务置入后台 ZSET 由守护进程完成定时无人值守发版。
+2. [ ] ⏪ **一键回滚 (Rollback) 防线**：在历史记录卡片中为曾经发布成功的流水线提供「一键回滚」操作，出现线上事故时做到秒级退回。
+3. [ ] 💬 **ChatOps 日志巡检**：当发版成功后，在飞书中支持回复 `@机器人 抓取最新 Pod 日志`，自动透传到 K8s/服务器截取尾部日志返回，将 ChatOps 理念贯穿始终。
 
 ---
 
