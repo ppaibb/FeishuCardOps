@@ -38,6 +38,7 @@ async def normalize_selection(
     selected_env: Optional[str] = None,
     cached_branches: Optional[list] = None,
     selected_vars: Optional[Dict[str, str]] = None,
+    force_refresh_branches: bool = False,
 ) -> Dict[str, Any]:
     projects = cfg.get("projects", [])
     if not projects:
@@ -56,11 +57,13 @@ async def normalize_selection(
         env_value = project["environments"][0]
 
     branches: List[str] = []
-    if cached_branches:
+    if not force_refresh_branches and cached_branches:
         branches = cached_branches
     elif gitlab_client:
         try:
-            branches = await gitlab_client.get_branches(repo["id"])
+            if force_refresh_branches:
+                await gitlab_client.invalidate_branches_cache(repo["id"])
+            branches = await gitlab_client.get_branches_cached(repo["id"])
         except Exception as e:
             logger.error(f"failed to fetch branches: {e}")
             branches = ["⚠️ 获取分支超时"]

@@ -185,7 +185,11 @@ async def feishu_card(request: Request):
     if current_field not in ["project", "repo", "refresh"] and stored_state.get("repo") == selected_repo and stored_state.get("branches"):
         cached_branches = stored_state.get("branches")
 
-    state = await normalize_selection(cfg, gitlab, selected_project, selected_repo, selected_branch, selected_env, cached_branches, selected_vars=selected_vars)
+    force_refresh_branches = (action_name == "refresh" or current_field in ["project", "repo"])
+    state = await normalize_selection(
+        cfg, gitlab, selected_project, selected_repo, selected_branch, selected_env, 
+        cached_branches, selected_vars=selected_vars, force_refresh_branches=force_refresh_branches
+    )
 
     if open_message_id:
         await save_card_state(open_message_id, state)

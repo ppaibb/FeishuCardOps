@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -86,6 +87,43 @@ class GitLabClient:
         except Exception as e:
             logger.error(f"GitLab API Exception: Failed to fetch branches for project {project_id}, error={e}")
         return ["main"]
+
+    async def get_branches_cached(self, project_id: int, ttl: int = 90) -> List[str]:
+        """获取分支列表，优先从 Redis 缓存读取（TTL 秒），降低对 GitLab 的频繁请求。"""
+        from core.redis_client import get_redis
+        cache_key = f"cardops:branches:{project_id}"
+        redis = get_redis()
+        if redis:
+            try:
+                cached = await redis.get(cache_key)
+                if cached:
+                    logger.debug("branches cache hit project_id=%s", project_id)
+                    return json.loads(cached)
+            except Exception as e:
+                logger.warning("branches cache read failed project_id=%s err=%s", project_id, e)
+
+        # 缓存未命中，真正请求 GitLab
+        branches = await self.get_branches(project_id)
+
+        if redis:
+            try:
+                await redis.set(cache_key, json.dumps(branches), ex=ttl)
+                logger.debug("branches cache set project_id=%s ttl=%s", project_id, ttl)
+            except Exception as e:
+                logger.warning("branches cache write failed project_id=%s err=%s", project_id, e)
+
+        return branches
+
+    async def invalidate_branches_cache(self, project_id: int) -> None:
+        """主动删除指定项目的分支缓存，用于刷新场景，确保下次能从 GitLab 拉最新数据。"""
+        from core.redis_client import get_redis
+        redis = get_redis()
+        if redis:
+            try:
+                await redis.delete(f"cardops:branches:{project_id}")
+                logger.debug("branches cache invalidated project_id=%s", project_id)
+            except Exception as e:
+                logger.warning("branches cache invalidate failed project_id=%s err=%s", project_id, e)
 
     async def latest_pipeline(self, project_id: int, ref: Optional[str] = None) -> Optional[Dict[str, Any]]:
         pipelines = await self.list_pipelines(project_id=project_id, ref=ref, per_page=1)
