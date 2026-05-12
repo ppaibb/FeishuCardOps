@@ -106,7 +106,7 @@ def check_approval_required(cfg: Dict[str, Any], project: str, env: str, repo: s
     for rule in reversed(approval_rules):
         if _match_rule(rule, project, env, repo):
             if "approvers" in rule:
-                rule_approvers = rule.get("approvers", [])
+                rule_approvers = rule.get("approvers", []) or []
                 
                 # 第一次匹配到的最具体的规则，决定了是否免审批以及需要 @ 谁
                 if not rule_matched:
