@@ -76,16 +76,43 @@ async def resolve_approval(approval_id: str, action: str, resolver_open_id: str)
             return {"ok": False, "msg": "该仓正在发布中，无法进行批准"}
 
         record["status"] = "approved"
-        from services.pipeline import background_run_pipeline
+        from services.pipeline import background_run_pipeline, delayed_update_card, next_card_version
+        from core.metrics import PIPELINE_TRIGGERED, ACTIVE_LOCKS
+        from core.card_builder import build_card, build_approval_card
+        
+        PIPELINE_TRIGGERED.labels(project=state.get("project", ""), repo=state.get("repo", ""), env=state.get("env", "")).inc()
+        ACTIVE_LOCKS.inc()
         asyncio.create_task(background_run_pipeline(feishu_client, gitlab, cfg, state, open_message_id, operator_open_id, open_chat_id))
+        
+        if open_message_id:
+            card = build_card(cfg, status="执行中", state=state, latest_pipeline_text="初始化中...", latest_result_text="已接收审批发版指令正在投递...", show_details=True, is_locked=True)
+            ver = next_card_version(open_message_id)
+            asyncio.create_task(delayed_update_card(feishu_client, open_message_id, card, 1.0, version=ver))
+            
         try: await feishu_client.send_text(open_chat_id, f"✅ 审批已通过！正在触发 [{state['project']}/{state['repo']}]...")
         except Exception: pass
         msg = "已批准，流水线即将触发"
     else:
+        from core.card_builder import build_approval_card
         record["status"] = "rejected"
         try: await feishu_client.send_text(open_chat_id, f"❌ 发版审批已驳回 [{state['project']}/{state['repo']}]")
         except Exception: pass
         msg = "已驳回"
+
+    # 更新审批卡片为已处理状态
+    try:
+        if record.get("approval_message_id"):
+            updated_approval_card = build_approval_card(
+                state=state,
+                requester_open_id=operator_open_id,
+                approval_id=approval_id,
+                approvers=record.get("approvers", []),
+                resolved_by=resolver_open_id,
+                status=record["status"]
+            )
+            await feishu_client.update_card(record["approval_message_id"], updated_approval_card)
+    except Exception as e:
+        logger.error("failed to update approval card: %s", e)
 
     r = get_redis()
     await r.setex(f"approval:{approval_id}", 7 * 24 * 3600, json.dumps(record, ensure_ascii=False))

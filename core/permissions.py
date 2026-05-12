@@ -100,9 +100,9 @@ def check_approval_required(cfg: Dict[str, Any], project: str, env: str, repo: s
     approval_rules: List[Dict[str, Any]] = permissions.get("approval_required", [])
     for rule in reversed(approval_rules):
         if _match_rule(rule, project, env, repo):
-            approvers = rule.get("approvers", [])
-            if approvers:
-                return approvers
+            if "approvers" in rule:
+                approvers = rule.get("approvers", [])
+                return approvers if approvers else None
     return None
 
 

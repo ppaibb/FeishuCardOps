@@ -300,12 +300,6 @@ async def feishu_card(request: Request):
             logger.warning("Repo %s is locked, run rejected.", state["repo_id"])
             return JSONResponse({"toast": {"type": "error", "content": "该仓正在发布，请稍后"}})
 
-        # ── 权限检查 ────────────────────────────────────────────
-        allowed, reason = check_permission(cfg, state["project"], state["env"], state["repo"], operator_open_id)
-        if not allowed:
-            logger.warning("permission denied user=%s project=%s env=%s repo=%s reason=%s", operator_open_id, state["project"], state["env"], state["repo"], reason)
-            return JSONResponse({"toast": {"type": "error", "content": f"🔒 权限不足：{reason}"}})
-
         # ── 审批检查 ────────────────────────────────────────────
         approvers = check_approval_required(cfg, state["project"], state["env"], state["repo"])
         if approvers:
@@ -315,6 +309,12 @@ async def feishu_card(request: Request):
                 open_message_id, operator_open_id, open_chat_id, approvers,
             )
             return JSONResponse({"toast": {"type": "info", "content": f"🔐 已发起审批请求 (#{approval_id})，请等待审批人操作"}})
+
+        # ── 权限检查 ────────────────────────────────────────────
+        allowed, reason = check_permission(cfg, state["project"], state["env"], state["repo"], operator_open_id)
+        if not allowed:
+            logger.warning("permission denied user=%s project=%s env=%s repo=%s reason=%s", operator_open_id, state["project"], state["env"], state["repo"], reason)
+            return JSONResponse({"toast": {"type": "error", "content": f"🔒 权限不足：{reason}"}})
 
         # ── 直接触发 ────────────────────────────────────────────
         if not await try_lock_repo(state["repo_id"]):

@@ -200,7 +200,9 @@ def build_approval_card(
     state: Dict[str, Any],
     requester_open_id: str,
     approval_id: str,
-    approvers: List[str] = None,
+    approvers: Optional[List[str]] = None,
+    resolved_by: Optional[str] = None,
+    status: str = "pending",
 ) -> Dict[str, Any]:
     """构建审批请求卡片"""
     variables_line = ""
@@ -215,7 +217,7 @@ def build_approval_card(
             variables_line = "\n" + "\n".join(v_lines)
     
     at_approvers = ""
-    if approvers:
+    if approvers and status == "pending":
         at_approvers = " ".join([f"<at id=\"{uid}\"></at>" for uid in approvers])
         
     content = (
@@ -228,45 +230,66 @@ def build_approval_card(
     if at_approvers:
         content += f"\n\n**请审批**：{at_approvers}"
 
+    elements: List[Dict[str, Any]] = [
+        {"tag": "markdown", "content": content},
+        {"tag": "hr"}
+    ]
+
+    header_template = "orange"
+    header_title = "🔐 发版审批请求"
+
+    if status == "pending":
+        elements.append({
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "✅ 批准发布"},
+                    "type": "primary",
+                    "value": {"action": "approve", "approval_id": approval_id},
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "❌ 驳回"},
+                    "type": "danger",
+                    "value": {"action": "reject", "approval_id": approval_id},
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🤖 获取 AI 审查报告"},
+                    "value": {
+                        "action": "review",
+                        "project": state["project"],
+                        "repo": state["repo"],
+                        "branch": state["branch"],
+                        "env": state["env"]
+                    },
+                },
+            ],
+        })
+        elements.append({
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": "⚠️ 发版前建议点击「获取 AI 审查报告」进行风险排查。仅配置的审批人可操作。"}],
+        })
+    else:
+        if status == "approved":
+            header_template = "green"
+            header_title = "✅ 审批已通过"
+            status_text = f"✅ **已批准发布**\n审批人：<at id=\"{resolved_by}\"></at>"
+        else:
+            header_template = "red"
+            header_title = "❌ 审批已驳回"
+            status_text = f"❌ **已驳回**\n操作人：<at id=\"{resolved_by}\"></at>"
+        
+        elements.append({
+            "tag": "markdown",
+            "content": status_text
+        })
+
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"template": "orange", "title": {"tag": "plain_text", "content": "🔐 发版审批请求"}},
-        "elements": [
-            {"tag": "markdown", "content": content},
-            {"tag": "hr"},
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "✅ 批准发布"},
-                        "type": "primary",
-                        "value": {"action": "approve", "approval_id": approval_id},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "❌ 驳回"},
-                        "type": "danger",
-                        "value": {"action": "reject", "approval_id": approval_id},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "🤖 获取 AI 审查报告"},
-                        "value": {
-                            "action": "review",
-                            "project": state["project"],
-                            "repo": state["repo"],
-                            "branch": state["branch"],
-                            "env": state["env"]
-                        },
-                    },
-                ],
-            },
-            {
-                "tag": "note",
-                "elements": [{"tag": "plain_text", "content": "⚠️ 发版前建议点击「获取 AI 审查报告」进行风险排查。仅配置的审批人可操作。"}],
-            },
-        ],
+        "header": {"template": header_template, "title": {"tag": "plain_text", "content": header_title}},
+        "elements": elements,
     }
 
 
