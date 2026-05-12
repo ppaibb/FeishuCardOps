@@ -241,10 +241,16 @@ async def feishu_card(request: Request):
             return JSONResponse({"toast": {"type": "error", "content": "权限不足：您不是卡片管理员"}})
         
         delete_name = raw_value.get("delete_name")
+        if not delete_name:
+            return JSONResponse({"toast": {"type": "error", "content": "未能获取到要删除的项目名称"}})
+
         redis = get_redis()
-        if redis and delete_name:
-            await redis.hdel(DYNAMIC_PROJECTS_KEY, delete_name)
-            PROJECT_DELETED.inc()
+        if redis:
+            deleted_count = await redis.hdel(DYNAMIC_PROJECTS_KEY, delete_name)
+            if deleted_count > 0:
+                PROJECT_DELETED.inc()
+            else:
+                return JSONResponse({"toast": {"type": "warning", "content": "该项目已不存在或被他人删除"}})
             
         # 刷新项目管理卡片
         all_projects = await get_all_projects()
