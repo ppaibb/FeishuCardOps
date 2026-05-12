@@ -295,13 +295,13 @@ async def feishu_card(request: Request):
             return JSONResponse({"toast": {"type": "error", "content": "该仓正在发布，请稍后"}})
 
         # ── 权限检查 ────────────────────────────────────────────
-        allowed, reason = check_permission(cfg, state["project"], state["env"], operator_open_id)
+        allowed, reason = check_permission(cfg, state["project"], state["env"], state["repo"], operator_open_id)
         if not allowed:
-            logger.warning("permission denied user=%s project=%s env=%s reason=%s", operator_open_id, state["project"], state["env"], reason)
+            logger.warning("permission denied user=%s project=%s env=%s repo=%s reason=%s", operator_open_id, state["project"], state["env"], state["repo"], reason)
             return JSONResponse({"toast": {"type": "error", "content": f"🔒 权限不足：{reason}"}})
 
         # ── 审批检查 ────────────────────────────────────────────
-        approvers = check_approval_required(cfg, state["project"], state["env"])
+        approvers = check_approval_required(cfg, state["project"], state["env"], state["repo"])
         if approvers:
             APPROVAL_TRIGGERED.labels(project=state["project"], env=state["env"]).inc()
             approval_id = await create_approval(
