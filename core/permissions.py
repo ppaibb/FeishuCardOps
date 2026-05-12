@@ -86,24 +86,47 @@ def check_permission(cfg: Dict[str, Any], project: str, env: str, repo: str, ope
     return True, ""
 
 
-def check_approval_required(cfg: Dict[str, Any], project: str, env: str, repo: str) -> Optional[List[str]]:
+def check_approval_required(cfg: Dict[str, Any], project: str, env: str, repo: str) -> Optional[Dict[str, List[str]]]:
     """
     检查是否需要审批。
 
     Returns:
-        如需审批返回审批人 open_id 列表，否则返回 None。
+        如需审批返回 dict 包含授权审批人和通知审批人，否则返回 None。
     """
     permissions = cfg.get("permissions")
     if not permissions:
         return None
 
     approval_rules: List[Dict[str, Any]] = permissions.get("approval_required", [])
+    
+    notify_approvers = None
+    all_authorized_approvers = set()
+    rule_matched = False
+
     for rule in reversed(approval_rules):
         if _match_rule(rule, project, env, repo):
             if "approvers" in rule:
-                approvers = rule.get("approvers", [])
-                return approvers if approvers else None
-    return None
+                rule_approvers = rule.get("approvers", [])
+                
+                # 第一次匹配到的最具体的规则，决定了是否免审批以及需要 @ 谁
+                if not rule_matched:
+                    rule_matched = True
+                    if not rule_approvers:
+                        # 空列表代表完全免审批
+                        return None
+                    notify_approvers = list(rule_approvers)
+                
+                # 将所有匹配规则（包括更宽泛的兜底规则）中的审批人加入授权集合
+                for a in rule_approvers:
+                    all_authorized_approvers.add(a)
+
+    if not rule_matched:
+        return None
+        
+    return {
+        "authorized_approvers": list(all_authorized_approvers),
+        "notify_approvers": notify_approvers or []
+    }
 
 
 def is_admin(cfg: Dict[str, Any], operator_open_id: str) -> bool:

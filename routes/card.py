@@ -301,12 +301,12 @@ async def feishu_card(request: Request):
             return JSONResponse({"toast": {"type": "error", "content": "该仓正在发布，请稍后"}})
 
         # ── 审批检查 ────────────────────────────────────────────
-        approvers = check_approval_required(cfg, state["project"], state["env"], state["repo"])
-        if approvers:
+        approvers_data = check_approval_required(cfg, state["project"], state["env"], state["repo"])
+        if approvers_data:
             APPROVAL_TRIGGERED.labels(project=state["project"], env=state["env"]).inc()
             approval_id = await create_approval(
                 feishu_client, gitlab, cfg, state,
-                open_message_id, operator_open_id, open_chat_id, approvers,
+                open_message_id, operator_open_id, open_chat_id, approvers_data,
             )
             return JSONResponse({"toast": {"type": "info", "content": f"🔐 已发起审批请求 (#{approval_id})，请等待审批人操作"}})
 

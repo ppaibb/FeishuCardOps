@@ -20,16 +20,22 @@ logger = logging.getLogger("feishu_gitlab_card_http")
 
 
 async def create_approval(feishu_client: FeishuClient, gitlab: Any, cfg: Dict[str, Any], state: Dict[str, Any],
-                          open_message_id: str, operator_open_id: str, open_chat_id: str, approvers: list) -> str:
+                          open_message_id: str, operator_open_id: str, open_chat_id: str, approvers_data: Dict[str, list]) -> str:
     approval_id = str(uuid.uuid4())[:8]
+    
+    authorized_approvers = approvers_data.get("authorized_approvers", [])
+    notify_approvers = approvers_data.get("notify_approvers", [])
+    
     record = {
         "approval_id": approval_id, "state": dict(state), "operator_open_id": operator_open_id,
-        "open_message_id": open_message_id, "open_chat_id": open_chat_id, "approvers": approvers, "status": "pending",
+        "open_message_id": open_message_id, "open_chat_id": open_chat_id, 
+        "approvers": authorized_approvers, "notify_approvers": notify_approvers, 
+        "status": "pending",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "resolved_by": None, "resolved_at": None,
         "approval_message_id": None,
     }
     
-    approval_card = build_approval_card(state, operator_open_id, approval_id, approvers=approvers)
+    approval_card = build_approval_card(state, operator_open_id, approval_id, approvers=notify_approvers)
     
     # 优先将审批请求发送给公共审计群组，避免私聊发版时审批人无法收到通知
     audit_chat_id = cfg.get("feishu", {}).get("audit_chat_id")
@@ -106,7 +112,7 @@ async def resolve_approval(approval_id: str, action: str, resolver_open_id: str)
                 state=state,
                 requester_open_id=operator_open_id,
                 approval_id=approval_id,
-                approvers=record.get("approvers", []),
+                approvers=record.get("notify_approvers", record.get("approvers", [])),
                 resolved_by=resolver_open_id,
                 status=record["status"]
             )
