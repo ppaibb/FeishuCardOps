@@ -38,7 +38,9 @@ router = APIRouter()
 @router.post("/feishu/card")
 async def feishu_card(request: Request):
     payload = await request.json()
-    logger.info("/feishu/card payload=%s", json.dumps(payload, ensure_ascii=False)[:3000])
+    event = payload.get("event", {})
+    action = event.get("action", {}) or {}
+    logger.info("/feishu/card received action_tag=%s action_value=%s", action.get("tag", "unknown"), action.get("value", {}))
 
     if payload.get("type") == "url_verification":
         return JSONResponse({"challenge": payload.get("challenge", "")})

@@ -22,6 +22,13 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+class HealthCheckFilter(logging.Filter):
+    def filter(self, record):
+        return not (record.args and len(record.args) >= 3 and record.args[2] == "/healthz")
+
+logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 app = FastAPI(title="feishu-gitlab-card-http")
 
 app.include_router(event_router)

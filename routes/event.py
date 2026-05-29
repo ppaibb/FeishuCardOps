@@ -123,7 +123,9 @@ async def process_text_message(text: str, chat_id: str, sender_open_id: str = ""
 @router.post("/feishu/event")
 async def feishu_event(request: Request):
     payload = await request.json()
-    logger.info("/feishu/event payload=%s", json.dumps(payload, ensure_ascii=False))
+    logger.info("/feishu/event received event_type=%s event_id=%s", 
+                payload.get("event", {}).get("event_type", "unknown"),
+                payload.get("header", {}).get("event_id", ""))
 
     if payload.get("type") == "url_verification":
         return JSONResponse({"challenge": payload.get("challenge", "")})
