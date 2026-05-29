@@ -62,9 +62,9 @@ class FeishuClient:
             logger.error("failed to get user name for %s: %s", open_id, e)
         return open_id
 
-    async def send_card(self, chat_id: str, card: Dict[str, Any]) -> Dict[str, Any]:
+    async def send_card(self, chat_id: str, card: Dict[str, Any], receive_id_type: str = "chat_id") -> Dict[str, Any]:
         token = await self.tenant_access_token()
-        url = f"{self.base_url}/open-apis/im/v1/messages?receive_id_type=chat_id"
+        url = f"{self.base_url}/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
         headers = {"Authorization": f"Bearer {token}"}
         payload = {
             "receive_id": chat_id,
@@ -81,9 +81,9 @@ class FeishuClient:
             raise RuntimeError(f"send card failed: {data}")
         return data
 
-    async def send_text(self, chat_id: str, text: str) -> Dict[str, Any]:
+    async def send_text(self, chat_id: str, text: str, receive_id_type: str = "chat_id") -> Dict[str, Any]:
         token = await self.tenant_access_token()
-        url = f"{self.base_url}/open-apis/im/v1/messages?receive_id_type=chat_id"
+        url = f"{self.base_url}/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
         headers = {"Authorization": f"Bearer {token}"}
         payload = {
             "receive_id": chat_id,

@@ -23,6 +23,10 @@ async def process_text_message(text: str, chat_id: str, sender_open_id: str = ""
         cfg = load_config()
         feishu = FeishuClient(cfg["feishu"]["app_id"], cfg["feishu"]["app_secret"])
         
+        if sender_open_id:
+            from services.notification import check_and_send_release_note
+            asyncio.create_task(check_and_send_release_note(cfg, sender_open_id))
+        
         if text.startswith("广播公告 "):
             from core.permissions import is_admin
             if not is_admin(cfg, sender_open_id):

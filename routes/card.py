@@ -47,6 +47,13 @@ async def feishu_card(request: Request):
 
     event = payload.get("event", {})
     action = event.get("action", {}) or {}
+    operator_open_id = event.get("operator", {}).get("operator_id", {}).get("open_id")
+    
+    if operator_open_id:
+        from services.notification import check_and_send_release_note
+        from core.config import load_config
+        asyncio.create_task(check_and_send_release_note(load_config(), operator_open_id))
+
     raw_value = action.get("value") or {}
     form_value = action.get("form_value") or {}
 
