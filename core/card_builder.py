@@ -643,6 +643,16 @@ def build_card(
                 "type": "default",
                 "value": {**action_base_val, "action": "locked"},
             },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "⏹️ 停止发版"},
+                "type": "danger",
+                "value": {**action_base_val, "action": "cancel_pipeline"},
+                "confirm": {
+                    "title": {"tag": "plain_text", "content": "确认停止发版"},
+                    "text": {"tag": "plain_text", "content": "确认要取消当前正在运行的流水线吗？这可能会导致部署处于中间状态。"}
+                }
+            },
         ]
     else:
         action_elements = [

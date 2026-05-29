@@ -162,7 +162,7 @@ async def feishu_card(request: Request):
             selected_env = option
         elif current_field and current_field.startswith("var_") and option:
             selected_vars[current_field[4:]] = option
-    elif action_name in {"run", "refresh", "history", "manage_projects", "delete_project"} and stored_state:
+    elif action_name in {"run", "refresh", "history", "manage_projects", "delete_project", "locked", "cancel_pipeline"} and stored_state:
         selected_project = stored_state.get("project")
         selected_repo = stored_state.get("repo")
         selected_branch = stored_state.get("branch")
@@ -195,9 +195,8 @@ async def feishu_card(request: Request):
         await save_card_state(open_message_id, state)
     logger.info("card action merged state=%s", state)
 
-    # ── 去重 ───────────────────────────────────────────────────
     dedup_key = ""
-    if action_name in {"run", "refresh", "history", "review", "manage_projects", "delete_project"}:
+    if action_name in {"run", "refresh", "history", "review", "manage_projects", "delete_project", "cancel_pipeline"}:
         dedup_key = f"{open_message_id}:{action_name}:{state.get('project')}:{state.get('repo')}:{state.get('branch')}:{state.get('env')}"
         dedup_window = 4 if action_name in {"run", "review"} else 2
         if not await check_action_dedup(dedup_key, dedup_window):
@@ -213,7 +212,23 @@ async def feishu_card(request: Request):
 
     # ── locked 按钮 ─────────────────────────────────────────────
     if action_name == "locked":
-        return JSONResponse({"toast": {"type": "info", "content": "当前仓库正在发布排队中，请等待上一任务完成！"}})
+        return JSONResponse({"toast": {"type": "info", "content": "发版中"}})
+
+    # ── 停止发版 ────────────────────────────────────────────────
+    if action_name == "cancel_pipeline":
+        if not await is_repo_locked(state["repo_id"]):
+            return JSONResponse({"toast": {"type": "warning", "content": "当前没有正在执行的流水线！"}})
+        try:
+            latest = await gitlab.latest_pipeline(project_id=state["repo_id"], ref=state["branch"])
+            if latest and latest.get("status") in {"running", "pending", "created"}:
+                pipeline_id = latest["id"]
+                await gitlab.cancel_pipeline(project_id=state["repo_id"], pipeline_id=pipeline_id)
+                return JSONResponse({"toast": {"type": "success", "content": f"流水线 #{pipeline_id} 取消信号已发送！请等待卡片状态更新"}})
+            else:
+                return JSONResponse({"toast": {"type": "warning", "content": "当前流水线不在运行状态中，无法取消"}})
+        except Exception as e:
+            logger.exception("cancel pipeline failed")
+            return JSONResponse({"toast": {"type": "error", "content": f"取消流水线失败: {e}"}})
 
     # ── 历史记录 ─────────────────────────────────────────────────
     if action_name == "history":

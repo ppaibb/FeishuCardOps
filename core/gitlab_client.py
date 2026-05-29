@@ -216,3 +216,14 @@ class GitLabClient:
             if resp.status_code == 200:
                 return resp.json()
             return []
+
+    async def cancel_pipeline(self, project_id: int, pipeline_id: int) -> Dict[str, Any]:
+        """取消流水线"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/pipelines/{pipeline_id}/cancel"
+        headers = {"PRIVATE-TOKEN": self.token}
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=headers)
+            if resp.status_code in [200, 201]:
+                return resp.json()
+            return {}
+
