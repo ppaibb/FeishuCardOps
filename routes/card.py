@@ -51,7 +51,6 @@ async def feishu_card(request: Request):
     
     if operator_open_id:
         from services.notification import check_and_send_release_note
-        from core.config import load_config
         asyncio.create_task(check_and_send_release_note(load_config(), operator_open_id))
 
     raw_value = action.get("value") or {}
