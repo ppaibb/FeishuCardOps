@@ -20,7 +20,10 @@ def status_meta(status: str, latest_result_text: str, latest_pipeline_text: str)
     return {"emoji": "🟢", "label": "就绪"}
 
 
-def get_env_display(e: str) -> str:
+def get_env_display(e: str, display_map: Optional[Dict[str, str]] = None) -> str:
+    # 优先使用项目级自定义映射（config 中 project.env_display），实现按项目区分显示名
+    if display_map and e in display_map:
+        return display_map[e]
     le = e.lower()
     if le in ["test", "测试"]:
         return "本地机房"
@@ -97,6 +100,7 @@ async def normalize_selection(
         "repo_id": repo["id"],
         "repo_path": repo["repo"],
         "gitlab_instance": gitlab_instance,
+        "env_display": project.get("env_display", {}),
         "branch": branch_value,
         "env": env_value,
         "branches": branches,
@@ -107,7 +111,7 @@ async def normalize_selection(
 
 def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: int, p_status: str, active_job_name: str, failed_job_info: str = "", commit_info: str = "") -> Dict[str, Any]:
     commit_line = f"\n**提交**：{commit_info}" if commit_info else ""
-    env_display = get_env_display(state['env'])
+    env_display = get_env_display(state['env'], state.get('env_display'))
     if p_status == "success":
         color = "green"
         emoji = "✅"
@@ -150,7 +154,7 @@ def build_history_card(
                 operator = f"👤 <at id=\"{rec['operator_open_id']}\"></at>"
 
             line = f"**{i}. 流水线 #{rec['pipeline_id']}**  |  {status_text}  |  {operator}\n"
-            line += f"　 🌿 分支：`{rec['branch']}`  ➡️  🚀 环境：`{get_env_display(rec['env'])}`"
+            line += f"　 🌿 分支：`{rec['branch']}`  ➡️  🚀 环境：`{get_env_display(rec['env'], state.get('env_display'))}`"
             
             if rec.get("module"): 
                 line += f"\n　 🧩 附加参数：`{rec['module']}`"
@@ -230,7 +234,7 @@ def build_approval_card(
         f"<at id=\"{requester_open_id}\"></at> **请求发布至生产环境**\n\n"
         f"**项目**：{state['project']} - {state['repo']}\n"
         f"**分支**：{state['branch']}\n"
-        f"**环境**：{state['env']}"
+        f"**环境**：{get_env_display(state['env'], state.get('env_display'))}"
         f"{variables_line}"
     )
     if at_approvers:
@@ -436,11 +440,12 @@ def build_card(
         for b in state["branches"]
     ]
 
+    env_display_map = project.get("env_display", {})
     env_options_enriched = [
-        {"text": {"tag": "plain_text", "content": get_env_display(e)}, "value": e}
+        {"text": {"tag": "plain_text", "content": get_env_display(e, env_display_map)}, "value": e}
         for e in project["environments"]
     ]
-    env_placeholder = get_env_display(state["env"])
+    env_placeholder = get_env_display(state["env"], env_display_map)
 
     status_color = "green"
     status_label = "空闲中 (Idle)"
