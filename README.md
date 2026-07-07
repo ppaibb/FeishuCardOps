@@ -49,7 +49,8 @@
 | 功能 | 说明 |
 |------|------|
 | 🏢 **多项目管理** | 一个机器人管理多个项目，每个项目可包含多个仓库 |
-| 🌿 **动态分支发现** | 实时从 GitLab 获取最新分支列表，无需手动维护 |
+| � **多 GitLab 后端** | 一个机器人跨多个 GitLab 实例纳管，仓库级绑定自动路由，老配置零改动兼容 |
+| �🌿 **动态分支发现** | 实时从 GitLab 获取最新分支列表，无需手动维护 |
 | 🎛️ **泛型自定义变量** | 通过 `variables` 注册仓库专属参数（取代硬编码 modules），全自动渲染至交互界面并无缝透传给流水线 |
 | 💬 **自然文字意图匹配** | 群聊发送 `XXX项目发版` 自动锁定卡片初始项目，下拉框全程智能前后联动，防切错环境 |
 | 🔒 **并发锁保护** | 同一仓库同时只能运行一条流水线，防止重复发版 |
@@ -184,7 +185,18 @@ gitlab:
   base_url: "http://gitlab:port"  # GitLab 实例地址
   access_token: "glpat-xxxx"      # GitLab Access Token
 
-# ---- 项目配置（支持多项目 × 多仓库 × 多环境 × 多模块）----
+# ---- 多 GitLab 后端（可选）----
+# 需要接入多个 GitLab 时启用；上面的单实例 gitlab 会自动注册为名为 "default" 的实例。
+# 每个实例必须有唯一 name，仓库通过 gitlab: <name> 字段声明归属，缺省则回退 default。
+gitlabs:
+  - name: "default"
+    base_url: "http://gitlab-a:port"
+    access_token: "glpat-aaaa"
+  - name: "huangpu"
+    base_url: "http://gitlab-b:port"
+    access_token: "glpat-bbbb"
+
+# ---- 项目配置（支持多项目 × 多仓库 × 多环境 × 多模块 × 多 GitLab）----
 projects:
   - name: "我的项目"               # 项目名（同时也是触发词前缀）
     environments: ["test", "prod"]
@@ -192,6 +204,7 @@ projects:
       - name: "后端仓库"
         repo: "group/backend"
         id: 10                     # GitLab Project ID
+        gitlab: "huangpu"          # 【可选】该仓库所属 GitLab 实例名，省略则用 default
         modules:                   # 【可选】微服务列表
           - "service-user"
           - "service-order"
@@ -446,7 +459,11 @@ scrape_configs:
 - [x] 📢 **静默更新触达**：依托 Redis 实现类似 App 的“弹窗仅展示一次”能力，通过飞书私聊向活跃用户精准推送更新日志。
 - [x] 🧹 **底层日志重构**：全面接入应用级 HTTP 请求拦截与 Uvicorn 过滤器，消灭无效刷屏，增强运维排错可观测性。
 
-### 第五阶段（TODO & 演进方向）
+### 第五阶段（多 GitLab 后端接入 - 已完成）
+- [x] 🌐 **多 GitLab 实例支持**：通过 `gitlabs` 列表注册任意数量的 GitLab 后端，单机器人跨实例统一纳管，原单实例 `gitlab` 配置作为默认实例平滑兼容、零改动。
+- [x] 🔀 **仓库级实例路由**：为每个仓库标注 `gitlab: <实例名>`，卡片选中仓库后自动路由到对应后端进行分支拉取、流水线触发、历史查询与 AI Review，全链路无感切换。
+
+### 第六阶段（TODO & 演进方向）
 1. [ ] ⏰ **预约延时发版**：通过飞书卡片自带的日期控件（Picker_datetime），将部署任务置入后台 ZSET 由守护进程完成定时无人值守发版。
 2. [ ] ⏪ **一键回滚 (Rollback) 防线**：在历史记录卡片中为曾经发布成功的流水线提供「一键回滚」操作，出现线上事故时做到秒级退回。
 3. [ ] 💬 **ChatOps 日志巡检**：当发版成功后，在飞书中支持回复 `@机器人 抓取最新 Pod 日志`，自动透传到 K8s/服务器截取尾部日志返回，将 ChatOps 理念贯穿始终。

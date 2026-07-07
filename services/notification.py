@@ -7,7 +7,7 @@ from core.redis_client import get_redis
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
-CURRENT_VERSION = "v1.6.0"
+CURRENT_VERSION = "v1.7.0"
 
 RELEASE_NOTE_CARD = {
     "config": {"wide_screen_mode": True},
@@ -15,7 +15,7 @@ RELEASE_NOTE_CARD = {
     "elements": [
         {
             "tag": "markdown",
-            "content": "1. 🛑 **新增停止发版功能**：排队/运行中可随时手动停止。\n2. 🤖 **自然语言一键发版**：在群里对机器人说“项目/仓库/环境”，AI为你预填所有参数！"
+            "content": "1. 🌐 **多 GitLab 后端支持**：现在一个机器人可同时管理多个 GitLab 实例！在配置中为仓库指定所属实例，即可跨实例触发流水线、查分支、看历史。\n2. 🔀 **仓库级智能路由**：卡片选择仓库后自动路由到对应的 GitLab 后端，全程无感，老配置零改动平滑兼容。"
         }
     ]
 }

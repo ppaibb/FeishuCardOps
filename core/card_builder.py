@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Dict, List, Optional
 
-from core.gitlab_client import GitLabClient
+from core.gitlab_client import GitLabClient, build_gitlab_client, resolve_gitlab_instance_name
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
@@ -56,14 +56,19 @@ async def normalize_selection(
     if env_value not in project["environments"]:
         env_value = project["environments"][0]
 
+    # 根据 repo 绑定的实例名解析出对应的 GitLab 客户端；
+    # 若 repo 未指定实例或该实例不存在，则回退到调用方传入的客户端。
+    gitlab_instance = resolve_gitlab_instance_name(cfg, repo=repo)
+    repo_gitlab_client = build_gitlab_client(cfg, repo=repo) or gitlab_client
+
     branches: List[str] = []
     if not force_refresh_branches and cached_branches:
         branches = cached_branches
-    elif gitlab_client:
+    elif repo_gitlab_client:
         try:
             if force_refresh_branches:
-                await gitlab_client.invalidate_branches_cache(repo["id"])
-            branches = await gitlab_client.get_branches_cached(repo["id"])
+                await repo_gitlab_client.invalidate_branches_cache(repo["id"])
+            branches = await repo_gitlab_client.get_branches_cached(repo["id"])
         except Exception as e:
             logger.error(f"failed to fetch branches: {e}")
             branches = ["⚠️ 获取分支超时"]
@@ -91,6 +96,7 @@ async def normalize_selection(
         "repo": repo["name"],
         "repo_id": repo["id"],
         "repo_path": repo["repo"],
+        "gitlab_instance": gitlab_instance,
         "branch": branch_value,
         "env": env_value,
         "branches": branches,

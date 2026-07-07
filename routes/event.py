@@ -9,7 +9,7 @@ from core.card_builder import build_card, normalize_selection
 from services.project_manager import get_all_projects, parse_and_add_project, delete_project
 from core.config import load_config
 from core.feishu_client import FeishuClient
-from core.gitlab_client import GitLabClient
+from core.gitlab_client import GitLabClient, build_gitlab_client
 from core.state import check_action_dedup, is_repo_locked
 
 logger = logging.getLogger("feishu_gitlab_card_http")
@@ -76,7 +76,7 @@ async def process_text_message(text: str, chat_id: str, sender_open_id: str = ""
 
         if "发版" in text or "发布" in text:
             cfg["projects"] = await get_all_projects()
-            gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
+            gitlab = build_gitlab_client(cfg) or GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
             
             # 使用大模型智能提取意图
             from services.intent_parser import extract_deploy_intent

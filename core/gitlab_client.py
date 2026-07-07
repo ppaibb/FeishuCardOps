@@ -234,3 +234,101 @@ class GitLabClient:
                 return resp.json()
             return {}
 
+
+DEFAULT_GITLAB_INSTANCE = "default"
+
+
+def load_gitlab_instances(cfg: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    """
+    合并 `gitlab`（单实例，向后兼容）与 `gitlabs`（多实例列表）为
+    `实例名 -> {base_url, access_token}` 字典。
+
+    - 旧版单实例配置 `gitlab: {base_url, access_token}` 会注册为名为 "default" 的实例。
+    - 新版 `gitlabs` 列表中每一项需带 `name`，可覆盖同名实例。
+    """
+    instances: Dict[str, Dict[str, str]] = {}
+
+    single = cfg.get("gitlab") or {}
+    if single.get("base_url"):
+        instances[DEFAULT_GITLAB_INSTANCE] = {
+            "base_url": single.get("base_url", ""),
+            "access_token": single.get("access_token", ""),
+        }
+
+    for inst in cfg.get("gitlabs", []) or []:
+        name = inst.get("name")
+        if name and inst.get("base_url"):
+            instances[name] = {
+                "base_url": inst.get("base_url", ""),
+                "access_token": inst.get("access_token", ""),
+            }
+
+    return instances
+
+
+def resolve_gitlab_conf(
+    cfg: Dict[str, Any],
+    repo: Optional[Dict[str, Any]] = None,
+    instance_name: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
+    """
+    解析出应使用的 GitLab 实例配置 `{base_url, access_token}`。
+
+    优先级：显式 instance_name > repo 的 `gitlab` 字段 > 默认实例 > 第一个可用实例。
+    若没有任何实例配置则返回 None。
+    """
+    instances = load_gitlab_instances(cfg)
+    if not instances:
+        return None
+
+    name = instance_name
+    if not name and isinstance(repo, dict):
+        name = repo.get("gitlab")
+
+    if name and name in instances:
+        return instances[name]
+
+    if DEFAULT_GITLAB_INSTANCE in instances:
+        return instances[DEFAULT_GITLAB_INSTANCE]
+
+    return next(iter(instances.values()))
+
+
+def resolve_gitlab_instance_name(
+    cfg: Dict[str, Any],
+    repo: Optional[Dict[str, Any]] = None,
+    instance_name: Optional[str] = None,
+) -> Optional[str]:
+    """解析出应使用的 GitLab 实例名称（用于持久化到 state 以便异步任务重建客户端）。"""
+    instances = load_gitlab_instances(cfg)
+    if not instances:
+        return None
+
+    name = instance_name
+    if not name and isinstance(repo, dict):
+        name = repo.get("gitlab")
+
+    if name and name in instances:
+        return name
+
+    if DEFAULT_GITLAB_INSTANCE in instances:
+        return DEFAULT_GITLAB_INSTANCE
+
+    return next(iter(instances.keys()))
+
+
+def build_gitlab_client(
+    cfg: Dict[str, Any],
+    repo: Optional[Dict[str, Any]] = None,
+    instance_name: Optional[str] = None,
+) -> Optional["GitLabClient"]:
+    """
+    根据 repo 配置或实例名构建对应实例的 GitLabClient。
+
+    找不到任何实例配置时返回 None，调用方需自行处理回退逻辑。
+    """
+    conf = resolve_gitlab_conf(cfg, repo=repo, instance_name=instance_name)
+    if not conf:
+        return None
+    return GitLabClient(conf["base_url"], conf["access_token"])
+

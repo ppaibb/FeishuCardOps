@@ -6,7 +6,7 @@ import anthropic
 
 from core.config import load_config
 from core.redis_client import get_redis
-from core.gitlab_client import GitLabClient
+from core.gitlab_client import GitLabClient, build_gitlab_client, load_gitlab_instances
 from core.metrics import PROJECT_REGISTERED
 
 logger = logging.getLogger("feishu_gitlab_card_http")
@@ -25,7 +25,8 @@ JSON Schema要求如下：
     {
       "name": "仓库显示名",
       "id": 整数仓库GitLabID,
-      "repo": "比如 group/repo 字符串格式"
+      "repo": "比如 group/repo 字符串格式",
+      "gitlab": "可选，GitLab 实例名。仅当用户明确指定该仓库属于哪个 GitLab 实例时填写，否则省略此字段"
     }
   ]
 }
@@ -33,7 +34,8 @@ JSON Schema要求如下：
 要求：
 1. 如果用户没有提供足够信息，尽可能推断。
 2. GitLab ID 必须提取为整数（如果用户没写，则设为null或默认随便写，但通常用户会写）。
-3. 必须输出合法且只有一条的 JSON。不要加 markdown 代码块标签！直接大括号开头。
+3. gitlab 字段为可选，仅当用户明确说明仓库所属的 GitLab 实例时才填写，否则不要包含该字段。
+4. 必须输出合法且只有一条的 JSON。不要加 markdown 代码块标签！直接大括号开头。
 """
 
 async def get_all_projects() -> List[Dict[str, Any]]:
@@ -124,15 +126,25 @@ async def parse_and_add_project(text: str) -> str:
             return "❌ AI 无法完整提取所需配置，请确保告知了项目名称、环境以及仓库详情。"
             
         # 拿第一个仓库做检验 （Gitlab 接入校验）
-        gitlab_cfg = cfg.get("gitlab", {})
-        gl_client = GitLabClient(gitlab_cfg.get("base_url", ""), gitlab_cfg.get("access_token", ""))
-        
         test_repo = repos[0]
         test_id = test_repo.get("id")
-        
+
         if not test_id:
             return f"❌ 必须提供仓库在 GitLab 的 Project ID。"
-            
+
+        # 校验 repo 绑定的 GitLab 实例名是否存在（若指定了）
+        instances = load_gitlab_instances(cfg)
+        for r in repos:
+            inst_name = r.get("gitlab")
+            if inst_name and inst_name not in instances:
+                available = ", ".join(instances.keys()) or "（无）"
+                return f"❌ 仓库【{r.get('name')}】指定的 GitLab 实例【{inst_name}】不存在。可用实例：{available}"
+
+        # 按第一个仓库绑定的实例构建客户端进行连通性校验
+        gl_client = build_gitlab_client(cfg, repo=test_repo)
+        if not gl_client:
+            return "❌ 未找到任何可用的 GitLab 实例配置，请检查 config.yaml。"
+
         try:
             gl_project = await gl_client.get_project(test_id)
             if not gl_project:

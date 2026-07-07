@@ -11,7 +11,7 @@ from core.card_builder import build_card, build_history_card, build_project_mana
 from services.project_manager import get_all_projects, get_dynamic_project_names, DYNAMIC_PROJECTS_KEY
 from core.config import load_config
 from core.feishu_client import FeishuClient
-from core.gitlab_client import GitLabClient
+from core.gitlab_client import GitLabClient, build_gitlab_client
 from core.permissions import check_approval_required, check_permission, is_admin
 from core.redis_client import get_redis
 from core.state import (
@@ -187,7 +187,7 @@ async def feishu_card(request: Request):
         selected_project, selected_repo, selected_branch, selected_env, selected_vars,
     )
 
-    gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
+    gitlab = build_gitlab_client(cfg) or GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
 
     cached_branches = None
     if current_field not in ["project", "repo", "refresh"] and stored_state.get("repo") == selected_repo and stored_state.get("branches"):
@@ -198,6 +198,9 @@ async def feishu_card(request: Request):
         cfg, gitlab, selected_project, selected_repo, selected_branch, selected_env, 
         cached_branches, selected_vars=selected_vars, force_refresh_branches=force_refresh_branches
     )
+
+    # 依据解析出的仓库所绑定的 GitLab 实例，重建后续操作使用的客户端
+    gitlab = build_gitlab_client(cfg, instance_name=state.get("gitlab_instance")) or gitlab
 
     if open_message_id:
         await save_card_state(open_message_id, state)

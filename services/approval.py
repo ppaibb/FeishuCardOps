@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 from core.card_builder import build_approval_card
 from core.config import load_config
 from core.feishu_client import FeishuClient
-from core.gitlab_client import GitLabClient
+from core.gitlab_client import GitLabClient, build_gitlab_client
 from core.redis_client import get_redis
 
 logger = logging.getLogger("feishu_gitlab_card_http")
@@ -73,8 +73,9 @@ async def resolve_approval(approval_id: str, action: str, resolver_open_id: str)
 
     cfg = load_config()
     feishu_client = FeishuClient(app_id=cfg["feishu"]["app_id"], app_secret=cfg["feishu"]["app_secret"])
-    gitlab = GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
     state, open_message_id, operator_open_id, open_chat_id = record["state"], record["open_message_id"], record["operator_open_id"], record["open_chat_id"]
+    # 依据审批记录中保存的实例名重建客户端，确保触发到发起审批时所选的 GitLab 实例
+    gitlab = build_gitlab_client(cfg, instance_name=state.get("gitlab_instance")) or GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
 
     if action == "approve":
         from core.state import try_lock_repo
