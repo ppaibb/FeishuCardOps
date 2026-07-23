@@ -94,6 +94,28 @@ async def normalize_selection(
         val = selected_vars.get(vk) if selected_vars.get(vk) in vopts else vopts[0]
         vars_val[vk] = val
 
+    # 解析当前环境对应的访问地址（access 可为 {env: url 或 [url...]}、字符串或列表结构）。
+    access_cfg = repo.get("access", {})
+    access_urls: List[str] = []
+    if isinstance(access_cfg, dict):
+        raw = access_cfg.get(env_value) or access_cfg.get("default")
+        if isinstance(raw, str) and raw:
+            access_urls = [raw]
+        elif isinstance(raw, list):
+            access_urls = [u for u in raw if isinstance(u, str) and u]
+    elif isinstance(access_cfg, str) and access_cfg:
+        access_urls = [access_cfg]
+    elif isinstance(access_cfg, list):
+        access_urls = [u for u in access_cfg if isinstance(u, str) and u]
+
+    # 解析访问提示信息（access_note 可为 {env: note} 字典或通用字符串）。
+    access_note_raw = repo.get("access_note", "")
+    access_note = ""
+    if isinstance(access_note_raw, dict):
+        access_note = str(access_note_raw.get(env_value) or access_note_raw.get("default") or "")
+    elif isinstance(access_note_raw, str):
+        access_note = access_note_raw
+
     return {
         "project": project["name"],
         "repo": repo["name"],
@@ -101,6 +123,8 @@ async def normalize_selection(
         "repo_path": repo["repo"],
         "gitlab_instance": gitlab_instance,
         "env_display": project.get("env_display", {}),
+        "access_urls": access_urls,
+        "access_note": access_note,
         "branch": branch_value,
         "env": env_value,
         "branches": branches,
@@ -112,10 +136,25 @@ async def normalize_selection(
 def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: int, p_status: str, active_job_name: str, failed_job_info: str = "", commit_info: str = "") -> Dict[str, Any]:
     commit_line = f"\n**提交**：{commit_info}" if commit_info else ""
     env_display = get_env_display(state['env'], state.get('env_display'))
+
+    # 组装访问信息行（仅发版成功时展示，放在流水线信息后面）
+    access_line = ""
+    access_urls = state.get("access_urls") or []
+    if access_urls:
+        if len(access_urls) == 1:
+            access_line += f"\n**访问地址**：[{access_urls[0]}]({access_urls[0]})"
+        else:
+            links = "、".join(f"[入口{idx}]({u})" for idx, u in enumerate(access_urls, 1))
+            access_line += f"\n**访问地址**：{links}"
+            
+    access_note = state.get("access_note") or ""
+    if access_note:
+        access_line += f"\n**💡 温馨提示**：{access_note}"
+
     if p_status == "success":
         color = "green"
         emoji = "✅"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务已执行成功！** 🎉\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}\n**流水线**：#{pipeline_id}"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务已执行成功！** 🎉\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}\n**流水线**：#{pipeline_id}{access_line}"
     elif p_status in {"failed", "canceled"}:
         color = "red"
         emoji = "❌"
@@ -127,10 +166,28 @@ def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: in
         emoji = "⏳"
         content = f"<at id=\"{operator_open_id}\"></at> **发版任务追踪中...**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}\n**流水线**：#{pipeline_id}\n**当前进展**：正在跟进 {active_job_name}"
 
+    elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": content}]
+
+    if p_status == "success" and access_urls:
+        button_actions = []
+        for idx, url in enumerate(access_urls, 1):
+            btn_text = "🌐 一键打开网页" if len(access_urls) == 1 else f"🌐 打开入口 {idx}"
+            button_actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": btn_text},
+                "type": "primary" if idx == 1 else "default",
+                "url": url,
+            })
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "action",
+            "actions": button_actions
+        })
+
     return {
         "config": {"wide_screen_mode": True},
         "header": {"template": color, "title": {"tag": "plain_text", "content": f"{emoji} 发版进度指示器"}},
-        "elements": [{"tag": "markdown", "content": content}]
+        "elements": elements
     }
 
 

@@ -7,7 +7,7 @@ from core.redis_client import get_redis
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
-CURRENT_VERSION = "v1.7.0"
+CURRENT_VERSION = "v1.8.0"
 
 RELEASE_NOTE_CARD = {
     "config": {"wide_screen_mode": True},
@@ -15,7 +15,7 @@ RELEASE_NOTE_CARD = {
     "elements": [
         {
             "tag": "markdown",
-            "content": "1. 🌐 **多 GitLab 后端支持**：现在一个机器人可同时管理多个 GitLab 实例！在配置中为仓库指定所属实例，即可跨实例触发流水线、查分支、看历史。\n2. 🔀 **仓库级智能路由**：卡片选择仓库后自动路由到对应的 GitLab 后端，全程无感，老配置零改动平滑兼容。"
+            "content": "1. 🌐 **流水线部署直通车**：流水线发版成功后，卡片将自动呈现对应的应用访问地址，并在底部新增 **`🌐 一键打开网页`** 直通按钮，在飞书中一键即可打开部署网页！\n2. 💡 **多环境适配提示**：支持按 `test`/`prod` 环境配置提示信息（如默认测试账号、回归注意项等），在发版成功卡片中贴心展示。"
         }
     ]
 }
