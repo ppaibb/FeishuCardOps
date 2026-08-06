@@ -95,6 +95,19 @@ class GitLabClient:
             logger.error(f"GitLab API Exception: Failed to fetch branches for project {project_id}, error={e}")
         return ["main"]
 
+    async def get_tags(self, project_id: int) -> List[str]:
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/tags"
+        headers = {"PRIVATE-TOKEN": self.token}
+        try:
+            async with httpx.AsyncClient(timeout=10, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return [t["name"] for t in resp.json()][:20]
+        except Exception as e:
+            logger.error(f"GitLab API Exception: Failed to fetch tags for project {project_id}, error={e}")
+        return []
+
+
     async def get_branches_cached(self, project_id: int, ttl: int = 90) -> List[str]:
         """获取分支列表，优先从 Redis 缓存读取（TTL 秒），降低对 GitLab 的频繁请求。"""
         from core.redis_client import get_redis
