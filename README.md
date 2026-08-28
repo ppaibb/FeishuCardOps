@@ -168,6 +168,19 @@ curl http://localhost:55000/healthz
 # 返回 {"ok": true} 即为正常
 ```
 
+### 5. 日常更新与维护 🔄
+
+由于项目默认支持代码目录挂载，日常拉取更新**无需重新编译镜像**：
+
+```bash
+# 日常改动代码（如拉取最新发版功能、修复 bug）：
+git pull origin main
+docker compose restart feishu-gitlab-bot   # ⚡ 秒级重启生效
+
+# 仅在 requirements.txt 变更第三方依赖时执行：
+docker compose up -d --build feishu-gitlab-bot
+```
+
 ---
 
 ## 📝 配置说明
