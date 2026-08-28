@@ -137,6 +137,24 @@ def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: in
     commit_line = f"\n**提交**：{commit_info}" if commit_info else ""
     env_display = get_env_display(state['env'], state.get('env_display'))
 
+    # 组装自定义构建变量信息行
+    variables_line = ""
+    if state.get("variables"):
+        v_lines = []
+        defined_keys = set()
+        for vdef in state.get("variables_def", []):
+            k = vdef["key"]
+            defined_keys.add(k)
+            if k in state["variables"]:
+                val = state["variables"][k]
+                label = vdef.get("label", k)
+                v_lines.append(f"**{label}**：`{val}`")
+        for k, val in state["variables"].items():
+            if k not in defined_keys:
+                v_lines.append(f"**{k}**：`{val}`")
+        if v_lines:
+            variables_line = "\n" + "\n".join(v_lines)
+
     # 组装访问信息行（仅发版成功时展示，放在流水线信息后面）
     access_line = ""
     access_urls = state.get("access_urls") or []
@@ -154,17 +172,17 @@ def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: in
     if p_status == "success":
         color = "green"
         emoji = "✅"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务已执行成功！** 🎉\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}\n**流水线**：#{pipeline_id}{access_line}"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务已执行成功！** 🎉\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}{variables_line}\n**流水线**：#{pipeline_id}{access_line}"
     elif p_status in {"failed", "canceled"}:
         color = "red"
         emoji = "❌"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务执行异常终止！**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}\n**流水线**：#{pipeline_id} [{p_status}]"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务执行异常终止！**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}{variables_line}\n**流水线**：#{pipeline_id} [{p_status}]"
         if failed_job_info:
             content += f"\n\n**失败点**：\n🚨 {failed_job_info}"
     else:
         color = "blue"
         emoji = "⏳"
-        content = f"<at id=\"{operator_open_id}\"></at> **发版任务追踪中...**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}\n**流水线**：#{pipeline_id}\n**当前进展**：正在跟进 {active_job_name}"
+        content = f"<at id=\"{operator_open_id}\"></at> **发版任务追踪中...**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}{variables_line}\n**流水线**：#{pipeline_id}\n**当前进展**：正在跟进 {active_job_name}"
 
     elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": content}]
 
