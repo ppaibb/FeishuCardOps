@@ -7,7 +7,7 @@ from core.redis_client import get_redis
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
-CURRENT_VERSION = "v1.8.0"
+CURRENT_VERSION = "v1.9.0"
 
 RELEASE_NOTE_CARD = {
     "config": {"wide_screen_mode": True},
@@ -15,7 +15,7 @@ RELEASE_NOTE_CARD = {
     "elements": [
         {
             "tag": "markdown",
-            "content": "1. 🌐 **流水线部署直通车**：流水线发版成功后，卡片将自动呈现对应的应用访问地址，并在底部新增 **`🌐 一键打开网页`** 直通按钮，在飞书中一键即可打开部署网页！\n2. 💡 **多环境适配提示**：支持按 `test`/`prod` 环境配置提示信息（如默认测试账号、回归注意项等），在发版成功卡片中贴心展示。"
+            "content": "1. 🎛️ **构建参数全面透出**：发版进度指示卡片（初始化/运行中/成功/异常）现已支持完整展示本次发版所选的自定义变量与微服务模块（如 `Module`、环境参数等），发版细节一目了然！\n2. 🌐 **流水线部署直通车**：流水线发版成功后，卡片将自动呈现对应的应用访问地址，并在底部提供 **`🌐 一键打开网页`** 直通按钮。\n3. 💡 **多环境适配提示**：支持按环境配置提示信息（如默认测试账号、回归注意项等），在发版成功卡片中贴心展示。"
         }
     ]
 }
