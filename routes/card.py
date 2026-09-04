@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from core.card_builder import build_card, build_history_card, build_project_management_card, normalize_selection
+from core.card_builder import build_card, build_history_card, build_project_management_card, build_sub_card, normalize_selection
 from services.project_manager import get_all_projects, get_dynamic_project_names, DYNAMIC_PROJECTS_KEY
 from core.config import load_config
 from core.feishu_client import FeishuClient
@@ -132,6 +132,84 @@ async def feishu_card(request: Request):
         result = await resolve_approval(approval_id, action_name, operator_open_id)
         toast_type = "success" if result["ok"] else "error"
         return JSONResponse({"toast": {"type": toast_type, "content": result["msg"]}})
+
+    # ── 发版结果确认闭环处理（收到/排查） ─────────────────────────
+    if action_name == "acknowledge_sub_card":
+        target_open_id = raw_value.get("operator_open_id") if isinstance(raw_value, dict) else None
+        pipeline_id = raw_value.get("pipeline_id") if isinstance(raw_value, dict) else None
+
+        # 1. 权限强校验：仅限被艾特的发版责任人确认
+        if not operator_open_id or (target_open_id and operator_open_id != target_open_id):
+            return JSONResponse({"toast": {"type": "warning", "content": "⚠️ 仅限被艾特的发版责任人确认哦！"}})
+
+        if not pipeline_id:
+            return JSONResponse({"toast": {"type": "error", "content": "参数缺失：未找到流水线 ID"}})
+
+        # 2. 幂等拦截与防刷
+        redis = get_redis()
+        ack_key = f"cardops:pipeline_ack:{pipeline_id}"
+        if redis:
+            existing_ack = await redis.get(ack_key)
+            if existing_ack:
+                return JSONResponse({"toast": {"type": "info", "content": "您之前已确认过了，无需重复操作"}})
+
+        # 3. 记录确认状态
+        feishu_client = FeishuClient(app_id=cfg["feishu"]["app_id"], app_secret=cfg["feishu"]["app_secret"])
+        try:
+            operator_name = await feishu_client.get_user_name(operator_open_id)
+        except Exception:
+            operator_name = operator_open_id
+
+        from datetime import datetime
+        ack_info = {
+            "ack_by": operator_open_id,
+            "ack_by_name": operator_name,
+            "ack_at": datetime.now().strftime("%H:%M"),
+        }
+
+        if redis:
+            await redis.set(ack_key, json.dumps(ack_info, ensure_ascii=False), ex=7 * 86400)
+
+        # 4. 读取 sub_card 元数据重新渲染卡片
+        sub_card_meta = None
+        if redis:
+            raw_meta = await redis.get(f"cardops:sub_card_meta:{pipeline_id}")
+            if raw_meta:
+                try:
+                    sub_card_meta = json.loads(raw_meta.decode("utf-8") if isinstance(raw_meta, bytes) else str(raw_meta))
+                except Exception as e:
+                    logger.warning("failed to parse sub_card_meta for %s: %s", pipeline_id, e)
+
+        if sub_card_meta:
+            updated_card = build_sub_card(
+                state=sub_card_meta.get("state", {}),
+                operator_open_id=sub_card_meta.get("operator_open_id", operator_open_id),
+                pipeline_id=pipeline_id,
+                p_status=sub_card_meta.get("p_status", "success"),
+                active_job_name=sub_card_meta.get("active_job_name", ""),
+                failed_job_info=sub_card_meta.get("failed_job_info", ""),
+                commit_info=sub_card_meta.get("commit_info", ""),
+                ack_info=ack_info,
+            )
+        else:
+            p_status = raw_value.get("p_status", "success") if isinstance(raw_value, dict) else "success"
+            dummy_state = stored_state or {"project": "流水线", "repo": f"#{pipeline_id}", "branch": "-", "env": "-"}
+            updated_card = build_sub_card(
+                state=dummy_state,
+                operator_open_id=operator_open_id,
+                pipeline_id=pipeline_id,
+                p_status=p_status,
+                active_job_name="",
+                ack_info=ack_info,
+            )
+
+        if open_message_id:
+            try:
+                await feishu_client.update_card(open_message_id, updated_card)
+            except Exception as e:
+                logger.error("failed to update sub_card after ack message_id=%s error=%s", open_message_id, e)
+
+        return JSONResponse({"toast": {"type": "success", "content": "✅ 已确认收到！"}})
 
     # Collect incoming config variables
     incoming_vars = {}

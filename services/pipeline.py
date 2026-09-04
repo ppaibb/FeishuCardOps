@@ -6,6 +6,7 @@ from typing import Any, Dict
 from core.card_builder import build_card, build_sub_card
 from core.feishu_client import FeishuClient
 from core.gitlab_client import GitLabClient
+from core.redis_client import get_redis
 from core.state import unlock_repo
 from core.metrics import PIPELINE_COMPLETED, PIPELINE_DURATION, AI_DIAGNOSIS_TRIGGERED, ACTIVE_LOCKS
 from services.history import add_record, update_record_status
@@ -107,6 +108,22 @@ async def poll_pipeline_status(
 
             if p_status in {"success", "failed", "canceled"}:
                 final_status = p_status
+                # 缓存 sub_card 元数据，供责任人点击确认「收到/排查」时重新渲染卡片
+                try:
+                    redis = get_redis()
+                    if redis:
+                        meta_data = {
+                            "state": state,
+                            "operator_open_id": operator_open_id,
+                            "pipeline_id": pipeline_id,
+                            "p_status": p_status,
+                            "active_job_name": active_job_name,
+                            "failed_job_info": failed_job_info,
+                            "commit_info": commit_info,
+                        }
+                        await redis.set(f"cardops:sub_card_meta:{pipeline_id}", json.dumps(meta_data, ensure_ascii=False), ex=7 * 86400)
+                except Exception as e:
+                    logger.warning("failed to cache sub_card_meta for pipeline %s: %s", pipeline_id, e)
                 break
         except Exception as e:
             logger.error("poll pipeline error %s", e)

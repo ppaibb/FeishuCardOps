@@ -133,7 +133,16 @@ async def normalize_selection(
     }
 
 
-def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: int, p_status: str, active_job_name: str, failed_job_info: str = "", commit_info: str = "") -> Dict[str, Any]:
+def build_sub_card(
+    state: Dict[str, Any],
+    operator_open_id: str,
+    pipeline_id: int,
+    p_status: str,
+    active_job_name: str,
+    failed_job_info: str = "",
+    commit_info: str = "",
+    ack_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     commit_line = f"\n**提交**：{commit_info}" if commit_info else ""
     env_display = get_env_display(state['env'], state.get('env_display'))
 
@@ -184,22 +193,53 @@ def build_sub_card(state: Dict[str, Any], operator_open_id: str, pipeline_id: in
         emoji = "⏳"
         content = f"<at id=\"{operator_open_id}\"></at> **发版任务追踪中...**\n\n**项目**：{state['project']} - {state['repo']}\n**分支**：{state['branch']}{commit_line}\n**环境**：{env_display}{variables_line}\n**流水线**：#{pipeline_id}\n**当前进展**：正在跟进 {active_job_name}"
 
+    # 终态且已确认时，在卡片正文追加反馈确认记录
+    if p_status in {"success", "failed", "canceled"} and ack_info:
+        ack_by = ack_info.get("ack_by_name") or ack_info.get("ack_by") or "责任人"
+        ack_at = ack_info.get("ack_at") or ""
+        at_suffix = f" 已于 {ack_at}" if ack_at else ""
+        content += f"\n\n📌 **知晓确认**：✅ {ack_by}{at_suffix} 确认知晓"
+
     elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": content}]
 
+    action_buttons = []
     if p_status == "success" and access_urls:
-        button_actions = []
         for idx, url in enumerate(access_urls, 1):
             btn_text = "🌐 一键打开网页" if len(access_urls) == 1 else f"🌐 打开入口 {idx}"
-            button_actions.append({
+            action_buttons.append({
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": btn_text},
                 "type": "primary" if idx == 1 else "default",
                 "url": url,
             })
+
+    # 流水线到达终态且尚未确认时，为责任人提供「收到/排查」确认按钮
+    if p_status in {"success", "failed", "canceled"} and not ack_info:
+        if p_status == "success":
+            btn_text = "👌 收到，已阅"
+            btn_type = "default" if action_buttons else "primary"
+        else:
+            btn_text = "👀 收到，排查中"
+            btn_type = "danger"
+
+        action_buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": btn_text},
+            "type": btn_type,
+            "value": {
+                "action": "acknowledge_sub_card",
+                "operator_open_id": operator_open_id,
+                "pipeline_id": pipeline_id,
+                "p_status": p_status,
+                "repo_id": state.get("repo_id"),
+            }
+        })
+
+    if action_buttons:
         elements.append({"tag": "hr"})
         elements.append({
             "tag": "action",
-            "actions": button_actions
+            "actions": action_buttons
         })
 
     return {
