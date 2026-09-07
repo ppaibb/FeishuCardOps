@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from core.gitlab_client import GitLabClient, build_gitlab_client, resolve_gitlab_instance_name
@@ -30,6 +31,32 @@ def get_env_display(e: str, display_map: Optional[Dict[str, str]] = None) -> str
     if le in ["prod", "production", "线上", "生产"]:
         return "阿里云"
     return f"{e}环境"
+
+
+def format_variable_display_label(raw_label: str, key: str = "") -> str:
+    """
+    格式化发版卡片、审批卡片等展示中的变量标签。
+    将「🧩 选服务」、「选服务」、「🧩 选微服务 (Module)」等统一规范展示为「服务」，
+    并在结果卡片中清理多余的提示动词（如「选」）及表情符号，使排版更加自然美观。
+    """
+    if not raw_label:
+        return "服务" if key == "TARGET_MODULE" else (key or "变量")
+
+    # 若为 TARGET_MODULE 或包含“选服务”/“选微服务”/“微服务”
+    if key == "TARGET_MODULE" or any(x in raw_label for x in ["选服务", "选微服务", "微服务"]):
+        return "服务"
+
+    # 去除常见的开头部 Emoji (如 🧩, 🎨, ⚙️, 🎛️ 等) 及紧随的空格
+    label = re.sub(r"^[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\s]+", "", raw_label).strip()
+
+    # 如果去掉 emoji 后是以“选”开头的词（例如“选服务”->“服务”），去掉“选”
+    if label.startswith("选") and len(label) > 1:
+        label = label[1:].strip()
+
+    # 去掉末尾可能存在的英文注释如 (Module)
+    label = re.sub(r"\s*\([^)]*\)$", "", label).strip()
+
+    return label or raw_label
 
 
 async def normalize_selection(
@@ -156,11 +183,12 @@ def build_sub_card(
             defined_keys.add(k)
             if k in state["variables"]:
                 val = state["variables"][k]
-                label = vdef.get("label", k)
+                label = format_variable_display_label(vdef.get("label", k), k)
                 v_lines.append(f"**{label}**：`{val}`")
         for k, val in state["variables"].items():
             if k not in defined_keys:
-                v_lines.append(f"**{k}**：`{val}`")
+                label = format_variable_display_label(k, k)
+                v_lines.append(f"**{label}**：`{val}`")
         if v_lines:
             variables_line = "\n" + "\n".join(v_lines)
 
@@ -336,7 +364,7 @@ def build_approval_card(
         for vdef in state.get("variables_def", []):
             k = vdef["key"]
             val = state["variables"].get(k)
-            label = vdef.get("label", k).split(" ", 1)[-1] if " " in vdef.get("label", k) else vdef.get("label", k)
+            label = format_variable_display_label(vdef.get("label", k), k)
             v_lines.append(f"**{label}**：{val}")
         if v_lines:
             variables_line = "\n" + "\n".join(v_lines)
