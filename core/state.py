@@ -74,3 +74,22 @@ async def unlock_repo(repo_id: int) -> None:
     r = get_redis()
     logger.info(f"unlocking repo_id={repo_id}")
     await r.delete(f"repo_lock:{repo_id}")
+
+
+async def try_lock_sonar(lock_scope: str, ttl: int = 1800) -> bool:
+    """尝试获取独立的 Sonar 扫描并发锁（与发版锁 repo_lock 完全隔离）"""
+    if not lock_scope:
+        return False
+    r = get_redis()
+    success = await r.set(f"sonar_lock:{lock_scope}", "1", nx=True, ex=ttl)
+    if success:
+        logger.info("try_lock_sonar succeeded scope=%s", lock_scope)
+    return bool(success)
+
+
+async def unlock_sonar(lock_scope: str) -> None:
+    if not lock_scope:
+        return
+    r = get_redis()
+    logger.info("unlocking sonar scope=%s", lock_scope)
+    await r.delete(f"sonar_lock:{lock_scope}")

@@ -149,6 +149,7 @@ async def normalize_selection(
         "repo_id": repo["id"],
         "repo_path": repo["repo"],
         "gitlab_instance": gitlab_instance,
+        "sonar_project_key": repo.get("sonar_project_key", ""),
         "env_display": project.get("env_display", {}),
         "access_urls": access_urls,
         "access_note": access_note,
@@ -274,6 +275,274 @@ def build_sub_card(
         "config": {"wide_screen_mode": True},
         "header": {"template": color, "title": {"tag": "plain_text", "content": f"{emoji} 发版进度指示器"}},
         "elements": elements
+    }
+
+
+def _sanitize_feishu_md(text: str, max_len: int = 90) -> str:
+    """清理可能干扰飞书 Markdown 解析的字符并做长度截断"""
+    cleaned = str(text or "").replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+    cleaned = cleaned.replace("<", "＜").replace(">", "＞").replace("`", "'")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    if len(cleaned) > max_len:
+        return cleaned[: max_len - 3] + "..."
+    return cleaned
+
+
+def _short_location(location: str, max_len: int = 56) -> str:
+    loc = str(location or "").strip()
+    if len(loc) <= max_len:
+        return loc
+    head = max_len // 3
+    tail = max_len - head - 3
+    return f"{loc[:head]}...{loc[-tail:]}"
+
+
+def _sonar_sev_icon(severity: str) -> str:
+    s = (severity or "").upper()
+    if s in {"BLOCKER", "CRITICAL"}:
+        return "🔴"
+    if s in {"HIGH", "MAJOR"}:
+        return "🟠"
+    if s in {"MEDIUM", "MINOR"}:
+        return "🟡"
+    return "⚪"
+
+
+def sonar_report_needs_ack(p_status: str, report: Optional[Dict[str, Any]] = None) -> bool:
+    """当流水线异常、质量门禁未通过/警告，或存在高危问题/高危热点时，需要责任人确认闭环"""
+    if p_status in {"failed", "canceled"}:
+        return True
+    if not report:
+        return False
+    if str(report.get("qg_status") or "").upper() in {"ERROR", "WARN"}:
+        return True
+    for iss in report.get("issues") or []:
+        if str(iss.get("severity") or "").upper() in {"BLOCKER", "CRITICAL", "HIGH"}:
+            return True
+    for hs in report.get("hotspots") or []:
+        if str(hs.get("probability") or "").upper() == "HIGH":
+            return True
+    return False
+
+
+def build_sonar_card(
+    state: Dict[str, Any],
+    operator_open_id: str,
+    pipeline_id: int,
+    p_status: str,
+    active_job_name: str = "",
+    report: Optional[Dict[str, Any]] = None,
+    failed_job_info: str = "",
+    commit_info: str = "",
+    pipeline_url: str = "",
+    ack_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """构建 SonarQube 代码扫描追踪与结果汇报卡片"""
+    commit_line = f"\n**提交**：{commit_info}" if commit_info else ""
+
+    # 提取关键目标参数（如 TARGET_MODULE / 服务），避免冗长展示无关发版环境
+    var_parts: List[str] = []
+    if state.get("variables"):
+        defined_keys = set()
+        for vdef in state.get("variables_def", []):
+            k = vdef["key"]
+            defined_keys.add(k)
+            if k in state["variables"]:
+                label = format_variable_display_label(vdef.get("label", k), k)
+                var_parts.append(f"**{label}**：`{state['variables'][k]}`")
+        for k, val in state["variables"].items():
+            if k not in defined_keys and k != "ACTION":
+                label = format_variable_display_label(k, k)
+                var_parts.append(f"**{label}**：`{val}`")
+    var_inline = ("　|　" + "　|　".join(var_parts)) if var_parts else ""
+
+    pipeline_ref = f"[#{pipeline_id}]({pipeline_url})" if pipeline_url else f"#{pipeline_id}"
+    is_finished = p_status in {"success", "failed", "canceled"}
+    qg_status = str((report or {}).get("qg_status") or "").upper()
+    sonar_proj_name = (report or {}).get("project_name") or (report or {}).get("project_key") or ""
+    proj_suffix = f"（`{sonar_proj_name}`）" if sonar_proj_name else ""
+
+    has_high_issue = any(
+        str(iss.get("severity") or "").upper() in {"BLOCKER", "CRITICAL", "HIGH"}
+        for iss in ((report or {}).get("issues") or [])
+    )
+
+    if not is_finished:
+        header_color = "blue"
+        header_title = "⏳ SonarQube 代码扫描追踪中"
+        intro = f"<at id=\"{operator_open_id}\"></at> **正在执行代码质量扫描...**"
+    elif qg_status == "ERROR":
+        header_color = "red"
+        header_title = "❌ SonarQube 质量门禁未通过"
+        intro = f"<at id=\"{operator_open_id}\"></at> **代码扫描完成，质量门禁未通过！**"
+    elif qg_status == "WARN":
+        header_color = "orange"
+        header_title = "⚠️ SonarQube 质量门禁警告"
+        intro = f"<at id=\"{operator_open_id}\"></at> **代码扫描完成，质量门禁存在警告**"
+    elif p_status in {"failed", "canceled"} and not (report and (report.get("measures") or report.get("qg_conditions"))):
+        header_color = "red"
+        header_title = "❌ SonarQube 代码扫描异常"
+        intro = f"<at id=\"{operator_open_id}\"></at> **SonarQube 扫描流水线异常终止！**"
+    elif qg_status == "OK":
+        header_color = "green"
+        if has_high_issue:
+            header_title = "✅ SonarQube 门禁通过（含高危待处理问题）"
+        else:
+            header_title = "✅ SonarQube 代码扫描通过"
+        intro = f"<at id=\"{operator_open_id}\"></at> **SonarQube 代码扫描完成！** 🎉"
+    else:
+        header_color = "red" if p_status in {"failed", "canceled"} else "blue"
+        header_title = "🛡️ SonarQube 代码质量扫描报告"
+        intro = f"<at id=\"{operator_open_id}\"></at> **SonarQube 代码扫描完成**"
+
+    qg_badge_map = {
+        "OK": "✅ **通过 (OK)**",
+        "WARN": "⚠️ **警告 (WARN)**",
+        "ERROR": "❌ **未通过 (ERROR)**",
+    }
+    qg_line = f"　|　**质量门禁**：{qg_badge_map[qg_status]}" if qg_status in qg_badge_map else ""
+
+    summary_lines = [
+        intro,
+        "",
+        f"**项目**：{state['project']} - {state['repo']}{proj_suffix}",
+        f"**分支**：`{state['branch']}`{var_inline}{commit_line}",
+        f"**流水线**：{pipeline_ref}{qg_line}",
+    ]
+
+    if not is_finished:
+        summary_lines.append(f"**当前进展**：正在跟进 `{active_job_name or '阶段衔接中'}`")
+
+    if report and report.get("qg_conditions"):
+        summary_lines.append("")
+        summary_lines.append("**📈 质量门禁明细**")
+        for cond in report["qg_conditions"]:
+            cst = str(cond.get("status") or "").upper()
+            cicon = "✅" if cst == "OK" else ("❌" if cst == "ERROR" else "⚠️")
+            label = cond.get("label") or cond.get("metric_key") or ""
+            actual = cond.get("actual_value", "-")
+            comp = cond.get("comparator", "")
+            thr = cond.get("threshold", "")
+            thr_text = f"（失败阈值 {comp} {thr}）".strip() if (comp or thr) else ""
+            summary_lines.append(f"• {cicon} {label}：实际 `{actual}` {thr_text}")
+
+    elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(summary_lines)}]
+
+    # 指标、重点问题与热点分段展示
+    detail_sections: List[str] = []
+    if report:
+        measures = report.get("measures") or {}
+        if measures:
+            ncloc = measures.get("ncloc", "-")
+            dup = measures.get("duplicated_lines_density", "-")
+            cov = measures.get("coverage", "-")
+            sec = measures.get("security_issues", "-")
+            rel = measures.get("reliability_issues", "-")
+            mnt = measures.get("maintainability_issues", "-")
+            hsp = measures.get("security_hotspots", str(report.get("hotspot_total")) if report.get("hotspot_total", -1) >= 0 else "-")
+            sec_r = f" ({measures['security_rating']})" if measures.get("security_rating") else ""
+            rel_r = f" ({measures['reliability_rating']})" if measures.get("reliability_rating") else ""
+            mnt_r = f" ({measures['maintainability_rating']})" if measures.get("maintainability_rating") else ""
+            detail_sections.append(
+                f"**📊 全量代码指标**（代码行 `{ncloc}` · 重复率 `{dup}` · 覆盖率 `{cov}`）\n"
+                f"• 🔓 安全性：**{sec}**{sec_r}　|　🐛 可靠性：**{rel}**{rel_r}\n"
+                f"• 🔧 可维护性：**{mnt}**{mnt_r}　|　🔥 安全热点：**{hsp}**"
+            )
+
+        issue_total = report.get("issue_total", -1)
+        issues = report.get("issues") or []
+        if issue_total == 0:
+            detail_sections.append("🎉 **未解决代码问题**：`0` 个！")
+        elif issues:
+            header_tot = f"共 `{issue_total}` 个，展示前 {len(issues)} 条" if issue_total > 0 else f"展示前 {len(issues)} 条"
+            issue_lines = [f"**🚨 未解决重点问题**（{header_tot}）"]
+            for idx, iss in enumerate(issues, 1):
+                sev = str(iss.get("severity") or "INFO").upper()
+                qual = str(iss.get("quality") or "").upper()
+                badge = f"{sev}/{qual}" if qual else sev
+                icon = _sonar_sev_icon(sev)
+                loc = _short_location(iss.get("location") or "-")
+                msg = _sanitize_feishu_md(iss.get("message") or "", max_len=85)
+                rule = str(iss.get("rule") or "").strip()
+                rule_part = f" (`{rule}`)" if rule else ""
+                issue_lines.append(f"{idx}. {icon} `[{badge}]` `{loc}` — {msg}{rule_part}")
+            detail_sections.append("\n".join(issue_lines))
+
+        hotspot_total = report.get("hotspot_total", -1)
+        hotspots = report.get("hotspots") or []
+        if hotspot_total and hotspot_total > 0 and hotspots:
+            hs_lines = [f"**🔥 待审查安全热点**（共 `{hotspot_total}` 个，展示前 {len(hotspots)} 条）"]
+            for idx, hs in enumerate(hotspots, 1):
+                prob = str(hs.get("probability") or "MEDIUM").upper()
+                loc = _short_location(hs.get("location") or "-")
+                msg = _sanitize_feishu_md(hs.get("message") or "", max_len=80)
+                hs_lines.append(f"{idx}. 🔥 `[{prob}]` `{loc}` — {msg}")
+            detail_sections.append("\n".join(hs_lines))
+
+        if report.get("auth_denied") and not measures and not issues:
+            detail_sections.append(
+                "⚠️ **无法拉取明细指标 (HTTP 401/403)**：请在 `config.yaml` 的 `sonarqube.token` 或 GitLab `SONAR_API_TOKEN` 中配置 SonarQube User Token (`squ_...`)。"
+            )
+        elif report.get("error") and not measures and not issues:
+            detail_sections.append(f"⚠️ **SonarQube 明细拉取提示**：{_sanitize_feishu_md(report['error'], max_len=140)}")
+
+    if failed_job_info:
+        detail_sections.append(f"**🚨 异常详情**\n{failed_job_info}")
+
+    if is_finished and ack_info:
+        ack_by = ack_info.get("ack_by_name") or ack_info.get("ack_by") or "责任人"
+        ack_at = ack_info.get("ack_at") or ""
+        at_suffix = f" 已于 {ack_at}" if ack_at else ""
+        detail_sections.append(f"📌 **知晓确认**：✅ {ack_by}{at_suffix} 确认知晓")
+
+    if detail_sections:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": "\n\n".join(detail_sections)})
+
+    action_buttons: List[Dict[str, Any]] = []
+    dashboard_url = str((report or {}).get("dashboard_url") or "").strip()
+    if is_finished and dashboard_url:
+        action_buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🔍 打开 SonarQube 报告"},
+            "type": "primary",
+            "url": dashboard_url,
+        })
+    if is_finished and pipeline_url:
+        action_buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🔗 GitLab 流水线"},
+            "type": "default" if action_buttons else "primary",
+            "url": pipeline_url,
+        })
+
+    needs_ack = is_finished and bool(pipeline_id) and sonar_report_needs_ack(p_status, report)
+    if needs_ack and not ack_info:
+        is_severe_fail = qg_status in {"ERROR", "WARN"} or (p_status in {"failed", "canceled"} and not (report and report.get("measures")))
+        btn_text = "👀 收到，排查中" if is_severe_fail else "👌 收到，已知晓"
+        btn_type = "danger" if is_severe_fail else "default"
+        action_buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": btn_text},
+            "type": btn_type,
+            "value": {
+                "action": "acknowledge_sub_card",
+                "card_kind": "sonar",
+                "operator_open_id": operator_open_id,
+                "pipeline_id": pipeline_id,
+                "p_status": p_status,
+                "repo_id": state.get("repo_id"),
+            },
+        })
+
+    if action_buttons:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "action", "actions": action_buttons})
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": header_color, "title": {"tag": "plain_text", "content": header_title}},
+        "elements": elements,
     }
 
 
@@ -824,6 +1093,11 @@ def build_card(
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": "🤖 AI Review"},
                 "value": {**action_base_val, "action": "review"},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🛡️ Sonar 扫描"},
+                "value": {**action_base_val, "action": "sonar_scan"},
             },
             {
                 "tag": "button",

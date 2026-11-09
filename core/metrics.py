@@ -61,6 +61,26 @@ AI_DIAGNOSIS_TRIGGERED = Counter(
     ["project", "repo"],
 )
 
+# ───────────────────── SonarQube 指标 ─────────────────
+SONAR_SCAN_TRIGGERED = Counter(
+    "feishu_sonar_scan_triggered_total",
+    "SonarQube 代码扫描触发总次数",
+    ["project", "repo"],
+)
+
+SONAR_SCAN_COMPLETED = Counter(
+    "feishu_sonar_scan_completed_total",
+    "SonarQube 代码扫描完成总次数（按门禁/执行状态）",
+    ["project", "repo", "status"],
+)
+
+SONAR_SCAN_DURATION = Histogram(
+    "feishu_sonar_scan_duration_seconds",
+    "SonarQube 代码扫描从触发到结束的耗时（秒）",
+    ["project", "repo"],
+    buckets=[15, 30, 60, 120, 180, 300, 600, 900, 1800],
+)
+
 # ───────────────────── 卡片交互指标 ─────────────────
 CARD_INTERACTION = Counter(
     "feishu_card_interaction_total",

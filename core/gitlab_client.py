@@ -81,6 +81,20 @@ class GitLabClient:
                 return resp.text
             return ""
 
+    async def get_job_artifact_file(self, project_id: int, job_id: int, artifact_path: str) -> str:
+        """读取指定 Job 的单个归档文本文件内容（失败返回空字符串）"""
+        clean_path = artifact_path.lstrip("/")
+        url = f"{self.base_url}/api/v4/projects/{project_id}/jobs/{job_id}/artifacts/{clean_path}"
+        headers = {"PRIVATE-TOKEN": self.token}
+        try:
+            async with httpx.AsyncClient(timeout=20, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    return resp.text
+        except Exception as e:
+            logger.warning("get_job_artifact_file failed project_id=%s job_id=%s path=%s err=%s", project_id, job_id, clean_path, e)
+        return ""
+
     async def get_branches(self, project_id: int) -> List[str]:
         url = f"{self.base_url}/api/v4/projects/{project_id}/repository/branches"
         headers = {"PRIVATE-TOKEN": self.token}

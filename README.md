@@ -63,6 +63,7 @@
 | 💽 **Redis 持久化** | 并发锁/去重/历史/审批/Token 全部持久化存储，支持多副本部署 |
 | 👤 **飞书实名解析** | 自动调用通讯录 API 将 open_id 解析为中文姓名（7天缓存） |
 | 🤖 **AI Code Review** | 发版前一键 AI 代码审查，自动获取 MR/分支变更并根据固定专业模板生成排版精美的风控报告 |
+| 🛡️ **SonarQube 代码扫描** | 主控制台一键触发 `ACTION=sonar` 代码扫描，独立并发锁不阻塞发版，自动汇总质量门禁、全量指标评级、Top 重点问题与安全热点至飞书结果卡片 |
 | 🤖 **AI 故障诊断** | 流水线发生异常时，自动回溯抓取 GitLab 报错 Trace（尾端3000字符），调用大模型解析报错根因及修复建议 |
 | 🤖 AI 项目注册 | 支持自然语言对话直接向系统注册微服务发版配置，Agent 自动检验 GitLab 连通性并写入持久化 |
 | 🌐 应用直链与提示 | 发布成功后卡片自动呈现对应环境的应用 URL 超链接与 `🌐 一键打开网页` 飞书直联按钮，并展示提示信息 |
@@ -128,6 +129,7 @@
 | **交互卡片表单** | `card_state:{message_id}` | String | 缓存用户在卡片上的选择上下文。单卡片大小 <1KB，配备 **7天TTL有效期**。用户 7 天未操作的孤儿卡片会被自动回收。 |
 | **生产发版审批流** | `approval:{approval_id}` | String | 保存等待审批的部署详情参数。**存续期生命周期 7天**。过期防误操作自动剔除。 |
 | **发版并发防死锁** | `repo_lock:{repo_id}` | String | 原子性 `NX` 分布式锁，避免同仓库同时拉起多条破坏性流水线。程序正常结束会毫秒级主动释放 `delete`，并配备 **1小时极限兜底TTL** 以防进程崩溃导致死锁。 |
+| **Sonar 扫描并发锁** | `sonar_lock:{repo_id}:{branch}:{target}` | String | 按仓库/分支/目标模块独立加锁（**30分钟TTL**），与发版锁完全隔离，扫描不阻塞发版也不写进发版历史。 |
 | **防穿透与 AI 缓存** | `ai_review:...` 等 | String | 大模型分析缓存基于 Commit ID 生成特征键，避免发版重试时重复浪费 Token（**24时TTL**）；并发点击动作具备 **2-4秒TTL** 截流盾。 |
 | **动态项目配置** | `cardops:dynamic_projects` | Hash | 存放通过 AI 会话临时添加到系统里的工程配置，可于管理面板随时剔除或一键导出为静态 YAML。 |
 
@@ -269,6 +271,7 @@ permissions:
 | `ENV` | 部署环境 | `test` |
 | `DEPLOY_ENV` | 部署环境（兼容老字段） | `prod` |
 | `{自定义变量KEY}`| 在配置 `variables` 节点下注册的其他变量名，如 `TARGET_PROFILE` | `app` |
+| `ACTION` | 点击「🛡️ Sonar 扫描」时自动注入 | `sonar` |
 | `OPERATOR_NAME` | 触发人飞书中文姓名 | `张三` |
 | `OPERATOR_OPEN_ID` | 触发人飞书 open_id | `ou_505a3130...` |
 
@@ -342,15 +345,17 @@ FeishuCardOps/
 │   ├── redis_client.py        # Redis 异步连接池（单例）
 │   ├── feishu_client.py       # 飞书 API 客户端（全异步 + Redis Token 缓存）
 │   ├── gitlab_client.py       # GitLab API 客户端（全异步）
-│   ├── card_builder.py        # 卡片构建器（主卡/副卡/历史/审批）
+│   ├── sonar_client.py        # SonarQube Web API 客户端与 CI 日志/报告解析
+│   ├── card_builder.py        # 卡片构建器（主卡/副卡/Sonar报告/历史/审批）
 │   ├── permissions.py         # RBAC 权限控制
-│   ├── metrics.py             # Prometheus 指标定义（发版/AI/审批/交互）
+│   ├── metrics.py             # Prometheus 指标定义（发版/AI/Sonar/审批/交互）
 │   └── state.py               # Redis 状态管理（锁/去重/卡片状态）
 ├── routes/                    # 路由处理
 │   ├── card.py                # 卡片回调路由（含权限/审批/历史）
 │   └── event.py               # 事件订阅路由
 ├── services/                  # 业务服务
 │   ├── pipeline.py            # 流水线触发与轮询（全异步 + Commit 追踪）
+│   ├── sonar_scan.py          # SonarQube 扫描调度、轮询与卡片汇报
 │   ├── history.py             # 发版历史记录（Redis 持久化，100条/仓库）
 │   ├── approval.py            # 审批流管理（Redis 持久化，7天有效）
 │   ├── project_manager.py     # AI 动态项目注册与管理

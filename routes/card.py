@@ -7,7 +7,14 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from core.card_builder import build_card, build_history_card, build_project_management_card, build_sub_card, normalize_selection
+from core.card_builder import (
+    build_card,
+    build_history_card,
+    build_project_management_card,
+    build_sonar_card,
+    build_sub_card,
+    normalize_selection,
+)
 from services.project_manager import get_all_projects, get_dynamic_project_names, DYNAMIC_PROJECTS_KEY
 from core.config import load_config
 from core.feishu_client import FeishuClient
@@ -19,15 +26,18 @@ from core.state import (
     get_card_state,
     is_repo_locked,
     try_lock_repo,
+    try_lock_sonar,
     lock_repo,
     save_card_state,
 )
 from services.approval import create_approval, get_approval, resolve_approval
 from services.history import get_history
 from services.pipeline import background_run_pipeline, delayed_update_card, next_card_version
+from services.sonar_scan import background_run_sonar, build_sonar_lock_scope
 from core.metrics import (
     CARD_INTERACTION, APPROVAL_RESOLVED, PIPELINE_TRIGGERED,
     AI_REVIEW_TRIGGERED, PROJECT_DELETED, APPROVAL_TRIGGERED, ACTIVE_LOCKS,
+    SONAR_SCAN_TRIGGERED,
 )
 
 logger = logging.getLogger("feishu_gitlab_card_http")
@@ -103,6 +113,8 @@ async def feishu_card(request: Request):
             action_name = "refresh"
         elif "历史" in button_text:
             action_name = "history"
+        elif "Sonar" in button_text:
+            action_name = "sonar_scan"
         elif "批准" in button_text:
             action_name = "approve"
         elif "驳回" in button_text:
@@ -170,44 +182,89 @@ async def feishu_card(request: Request):
         if redis:
             await redis.set(ack_key, json.dumps(ack_info, ensure_ascii=False), ex=7 * 86400)
 
-        # 4. 读取 sub_card 元数据重新渲染卡片
-        sub_card_meta = None
-        if redis:
-            raw_meta = await redis.get(f"cardops:sub_card_meta:{pipeline_id}")
-            if raw_meta:
+        # 4. 读取卡片元数据重新渲染卡片（支持发版副卡与 Sonar 扫描结果卡）
+        card_kind = raw_value.get("card_kind") if isinstance(raw_value, dict) else None
+        sonar_card_meta = None
+        if card_kind == "sonar" and redis:
+            raw_sonar_meta = await redis.get(f"cardops:sonar_card_meta:{pipeline_id}")
+            if raw_sonar_meta:
                 try:
-                    sub_card_meta = json.loads(raw_meta.decode("utf-8") if isinstance(raw_meta, bytes) else str(raw_meta))
+                    sonar_card_meta = json.loads(
+                        raw_sonar_meta.decode("utf-8") if isinstance(raw_sonar_meta, bytes) else str(raw_sonar_meta)
+                    )
                 except Exception as e:
-                    logger.warning("failed to parse sub_card_meta for %s: %s", pipeline_id, e)
+                    logger.warning("failed to parse sonar_card_meta for %s: %s", pipeline_id, e)
 
-        if sub_card_meta:
-            updated_card = build_sub_card(
-                state=sub_card_meta.get("state", {}),
-                operator_open_id=sub_card_meta.get("operator_open_id", operator_open_id),
-                pipeline_id=pipeline_id,
-                p_status=sub_card_meta.get("p_status", "success"),
-                active_job_name=sub_card_meta.get("active_job_name", ""),
-                failed_job_info=sub_card_meta.get("failed_job_info", ""),
-                commit_info=sub_card_meta.get("commit_info", ""),
-                ack_info=ack_info,
-            )
+        if card_kind == "sonar":
+            if sonar_card_meta:
+                updated_card = build_sonar_card(
+                    state=sonar_card_meta.get("state", {}),
+                    operator_open_id=sonar_card_meta.get("operator_open_id", operator_open_id),
+                    pipeline_id=pipeline_id,
+                    p_status=sonar_card_meta.get("p_status", "success"),
+                    active_job_name=sonar_card_meta.get("active_job_name", ""),
+                    report=sonar_card_meta.get("report"),
+                    failed_job_info=sonar_card_meta.get("failed_job_info", ""),
+                    commit_info=sonar_card_meta.get("commit_info", ""),
+                    pipeline_url=sonar_card_meta.get("pipeline_url", ""),
+                    ack_info=ack_info,
+                )
+            else:
+                p_status = raw_value.get("p_status", "failed") if isinstance(raw_value, dict) else "failed"
+                dummy_state = stored_state or {"project": "流水线", "repo": f"#{pipeline_id}", "branch": "-", "env": "-"}
+                updated_card = build_sonar_card(
+                    state=dummy_state,
+                    operator_open_id=operator_open_id,
+                    pipeline_id=pipeline_id,
+                    p_status=p_status,
+                    ack_info=ack_info,
+                )
         else:
-            p_status = raw_value.get("p_status", "success") if isinstance(raw_value, dict) else "success"
-            dummy_state = stored_state or {"project": "流水线", "repo": f"#{pipeline_id}", "branch": "-", "env": "-"}
-            updated_card = build_sub_card(
-                state=dummy_state,
-                operator_open_id=operator_open_id,
-                pipeline_id=pipeline_id,
-                p_status=p_status,
-                active_job_name="",
-                ack_info=ack_info,
-            )
+            sub_card_meta = None
+            if redis:
+                raw_meta = await redis.get(f"cardops:sub_card_meta:{pipeline_id}")
+                if raw_meta:
+                    try:
+                        sub_card_meta = json.loads(raw_meta.decode("utf-8") if isinstance(raw_meta, bytes) else str(raw_meta))
+                    except Exception as e:
+                        logger.warning("failed to parse sub_card_meta for %s: %s", pipeline_id, e)
 
+            if sub_card_meta:
+                updated_card = build_sub_card(
+                    state=sub_card_meta.get("state", {}),
+                    operator_open_id=sub_card_meta.get("operator_open_id", operator_open_id),
+                    pipeline_id=pipeline_id,
+                    p_status=sub_card_meta.get("p_status", "success"),
+                    active_job_name=sub_card_meta.get("active_job_name", ""),
+                    failed_job_info=sub_card_meta.get("failed_job_info", ""),
+                    commit_info=sub_card_meta.get("commit_info", ""),
+                    ack_info=ack_info,
+                )
+            else:
+                p_status = raw_value.get("p_status", "success") if isinstance(raw_value, dict) else "success"
+                dummy_state = stored_state or {"project": "流水线", "repo": f"#{pipeline_id}", "branch": "-", "env": "-"}
+                updated_card = build_sub_card(
+                    state=dummy_state,
+                    operator_open_id=operator_open_id,
+                    pipeline_id=pipeline_id,
+                    p_status=p_status,
+                    active_job_name="",
+                    ack_info=ack_info,
+                )
+
+        target_message_ids = []
         if open_message_id:
+            target_message_ids.append(open_message_id)
+        if isinstance(sonar_card_meta, dict):
+            for sid in sonar_card_meta.get("sub_message_ids") or []:
+                if sid and sid not in target_message_ids:
+                    target_message_ids.append(sid)
+
+        for target_msg_id in target_message_ids:
             try:
-                await feishu_client.update_card(open_message_id, updated_card)
+                await feishu_client.update_card(target_msg_id, updated_card)
             except Exception as e:
-                logger.error("failed to update sub_card after ack message_id=%s error=%s", open_message_id, e)
+                logger.error("failed to update sub_card after ack message_id=%s error=%s", target_msg_id, e)
 
         return JSONResponse({"toast": {"type": "success", "content": "✅ 已确认收到！"}})
 
@@ -248,7 +305,7 @@ async def feishu_card(request: Request):
             selected_env = option
         elif current_field and current_field.startswith("var_") and option:
             selected_vars[current_field[4:]] = option
-    elif action_name in {"run", "refresh", "history", "manage_projects", "delete_project", "locked", "cancel_pipeline"} and stored_state:
+    elif action_name in {"run", "refresh", "history", "sonar_scan", "manage_projects", "delete_project", "locked", "cancel_pipeline"} and stored_state:
         selected_project = stored_state.get("project")
         selected_repo = stored_state.get("repo")
         selected_branch = stored_state.get("branch")
@@ -285,9 +342,9 @@ async def feishu_card(request: Request):
     logger.info("card action merged state=%s", state)
 
     dedup_key = ""
-    if action_name in {"run", "refresh", "history", "review", "manage_projects", "delete_project", "cancel_pipeline"}:
+    if action_name in {"run", "refresh", "history", "review", "sonar_scan", "manage_projects", "delete_project", "cancel_pipeline"}:
         dedup_key = f"{open_message_id}:{action_name}:{state.get('project')}:{state.get('repo')}:{state.get('branch')}:{state.get('env')}"
-        dedup_window = 4 if action_name in {"run", "review"} else 2
+        dedup_window = 4 if action_name in {"run", "review", "sonar_scan"} else 2
         if not await check_action_dedup(dedup_key, dedup_window):
             logger.info("dedup hit key=%s", dedup_key)
             return JSONResponse({})
@@ -394,6 +451,21 @@ async def feishu_card(request: Request):
         AI_REVIEW_TRIGGERED.labels(project=state["project"], repo=state["repo"]).inc()
         asyncio.create_task(run_code_review(feishu_client, gitlab, state, open_chat_id, operator_open_id))
         return JSONResponse({"toast": {"type": "info", "content": "🤖 AI 正在审查代码，结果稍后发送到群聊..."}})
+
+    # ── SonarQube 代码扫描 ─────────────────────────────────────────
+    if action_name == "sonar_scan":
+        if "⚠️" in state["branch"]:
+            return JSONResponse({"toast": {"type": "error", "content": "远程分支读取失败，请重新切一次仓库刷出正常分支后再执行！"}})
+
+        lock_scope = build_sonar_lock_scope(state)
+        if not await try_lock_sonar(lock_scope):
+            return JSONResponse({"toast": {"type": "warning", "content": "🛡️ 该目标正在执行 Sonar 扫描，请稍候..."}})
+
+        SONAR_SCAN_TRIGGERED.labels(project=state["project"], repo=state["repo"]).inc()
+        asyncio.create_task(
+            background_run_sonar(feishu_client, gitlab, cfg, state, operator_open_id, open_chat_id, lock_scope)
+        )
+        return JSONResponse({"toast": {"type": "info", "content": "🛡️ 已触发 SonarQube 代码扫描！结果卡片稍后发出..."}})
 
     # ── 执行发版 ─────────────────────────────────────────────────
     if action_name == "run":
