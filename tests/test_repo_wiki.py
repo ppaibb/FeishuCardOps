@@ -12,6 +12,7 @@ from core.wiki_engine import (
     DEFAULT_CONTEXT_CHARS,
     DEFAULT_FILE_CHAR_LIMIT,
     DEFAULT_MAX_OUTPUT_TOKENS,
+    AnthropicWikiModel,
     build_material,
     compute_wiki_config_hash,
     generate_wiki_bundle,
@@ -339,6 +340,68 @@ class TestWikiScannerAndEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t["id"] for t in bundle["topics"]], [f"mod-{i}" for i in range(1, 7)])
         self.assertGreaterEqual(max_in_flight, 2)
         self.assertTrue(any("已完成 `6/6`" in m for m in progress_msgs))
+
+    async def test_anthropic_wiki_model_boosts_on_thinking_max_tokens_and_cards_degrade_gracefully(self):
+        # 1. ThinkingBlock 耗尽 4096 配额导致无 text 块 -> 自动扩容 max_tokens 至 16384 重试成功
+        llm = AnthropicWikiModel(api_key="sk-test", base_url="https://api.example.com", model="MiniMax-M2.7", max_output_tokens=4096)
+
+        thinking_only_resp = MagicMock()
+        thinking_only_resp.stop_reason = "max_tokens"
+        thinking_only_resp.content = [MagicMock(type="thinking", thinking="x" * 1200)]
+        thinking_only_resp.usage = MagicMock(input_tokens=500, output_tokens=4096)
+
+        ok_resp = MagicMock()
+        ok_resp.stop_reason = "end_turn"
+        ok_resp.content = [
+            MagicMock(type="thinking", thinking="brief thought"),
+            MagicMock(type="text", text='{"cards": []}'),
+        ]
+        ok_resp.usage = MagicMock(input_tokens=520, output_tokens=180)
+
+        llm._client.messages.create = AsyncMock(side_effect=[thinking_only_resp, ok_resp])
+        out = await llm.call("cards.module", "Return JSON.", {"section": {"id": "ui"}})
+        self.assertEqual(out, '{"cards": []}')
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(llm.tokens, 500 + 4096 + 520 + 180)
+        self.assertEqual(llm._client.messages.create.call_args_list[0].kwargs["max_tokens"], 4096)
+        self.assertEqual(llm._client.messages.create.call_args_list[1].kwargs["max_tokens"], 16384)
+
+        # 2. 当 cards.module 多次耗尽/失败而正文已通过校验时，优雅降级生成兜底概览卡，不丢弃整库 Wiki
+        archive = _make_tar_gz({"README.md": "# Frontend\n", "src/theme/tokens.ts": "export const color = '#000';\n"})
+        source = scan_archive_bytes(archive, branch="main", commit_sha="ui001")
+
+        async def cards_failing_llm(purpose, instructions, ctx):
+            if purpose == "wiki.overview":
+                return "# 前端总览\n\n核心设计系统位于 `src/theme/tokens.ts:1`。" + ("补充总览描述信息。\n" * 8)
+            if purpose == "wiki.catalogue":
+                return json.dumps(
+                    {
+                        "sections": [
+                            {
+                                "id": "frontend-architecture-and-design-system",
+                                "title": "前端架构与设计系统",
+                                "goal": "梳理样式 Token 与架构规范",
+                                "files": ["src/theme/tokens.ts"],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if purpose == "wiki.page":
+                return "# 前端架构与设计系统\n\n设计 Token 定义在 `src/theme/tokens.ts:1`。" + ("详细设计系统解析条目。\n" * 10)
+            if purpose == "cards.module":
+                # 触发降级前 cards  stage 会收到精简后的 ctx（不重复塞全局 overview）
+                self.assertNotIn("overview", ctx)
+                raise ValueError("AI 模型未返回有效的文本内容（思考阶段耗尽输出配额）")
+            raise AssertionError(purpose)
+
+        bundle = await generate_wiki_bundle(source=source, repo_name="kitefly/ui", model_call=cards_failing_llm, max_pages=0)
+        self.assertEqual(bundle["pages_count"], 2)
+        self.assertGreaterEqual(bundle["cards_count"], 1)
+        self.assertIn(
+            "docs/repowiki/knowledge/frontend-architecture-and-design-system/overview.md",
+            bundle["files"],
+        )
 
 
 class TestGitLabWritebackAndFallback(unittest.IsolatedAsyncioTestCase):
