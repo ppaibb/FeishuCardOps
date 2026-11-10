@@ -33,16 +33,18 @@ from core.state import (
 )
 from core.wiki_engine import (
     DEFAULT_CONTEXT_CHARS,
+    DEFAULT_FILE_CHAR_LIMIT,
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MAX_PAGES,
+    DEFAULT_PAGE_CONCURRENCY,
     DEFAULT_WIKI_DIR,
-    WIKI_VERSION,
+    MAX_PAGES_HARD_CEILING,
     AnthropicWikiModel,
+    compute_wiki_config_hash,
     generate_wiki_bundle,
     git_blob_sha1,
     scan_archive_bytes,
-    stable_digest,
 )
 
 logger = logging.getLogger("feishu_gitlab_card_http")
@@ -120,13 +122,31 @@ def resolve_wiki_settings(cfg: Dict[str, Any], repo_conf: Optional[Dict[str, Any
     wiki_dir = str(repo_cfg.get("wiki_dir") or global_wiki.get("dir") or DEFAULT_WIKI_DIR).strip("/") or DEFAULT_WIKI_DIR
     subpath = str(repo_cfg.get("wiki_subpath") or global_wiki.get("subpath") or "").strip("/")
     locale = str(repo_cfg.get("wiki_locale") or global_wiki.get("locale") or "zh-CN").strip() or "zh-CN"
-    max_pages = min(_int_opt(repo_cfg.get("wiki_max_pages") or global_wiki.get("max_pages"), DEFAULT_MAX_PAGES), 20)
+
+    raw_pages = repo_cfg.get("wiki_max_pages")
+    if raw_pages is None:
+        raw_pages = global_wiki.get("max_pages")
+    if raw_pages is None or str(raw_pages).strip().lower() in {"", "auto", "none", "null"}:
+        max_pages = DEFAULT_MAX_PAGES
+    else:
+        parsed_pages = _int_opt(raw_pages, DEFAULT_MAX_PAGES, minimum=0)
+        max_pages = 0 if parsed_pages <= 0 else min(parsed_pages, MAX_PAGES_HARD_CEILING)
+
     context_chars = _int_opt(repo_cfg.get("wiki_context_chars") or global_wiki.get("context_chars"), DEFAULT_CONTEXT_CHARS, 4000)
     max_bytes = _int_opt(repo_cfg.get("wiki_max_bytes") or global_wiki.get("max_bytes"), DEFAULT_MAX_BYTES, 1024)
+    file_char_limit = _int_opt(
+        repo_cfg.get("wiki_file_char_limit") or global_wiki.get("file_char_limit"),
+        DEFAULT_FILE_CHAR_LIMIT,
+        2000,
+    )
     max_output_tokens = _int_opt(
-        global_wiki.get("max_output_tokens") or ai_cfg.get("wiki_max_output_tokens"),
+        repo_cfg.get("wiki_max_output_tokens") or global_wiki.get("max_output_tokens") or ai_cfg.get("wiki_max_output_tokens"),
         DEFAULT_MAX_OUTPUT_TOKENS,
         512,
+    )
+    concurrency = min(
+        _int_opt(repo_cfg.get("wiki_concurrency") or global_wiki.get("concurrency"), DEFAULT_PAGE_CONCURRENCY, 1),
+        6,
     )
 
     return {
@@ -136,7 +156,9 @@ def resolve_wiki_settings(cfg: Dict[str, Any], repo_conf: Optional[Dict[str, Any
         "max_pages": max_pages,
         "context_chars": context_chars,
         "max_bytes": max_bytes,
+        "file_char_limit": file_char_limit,
         "max_output_tokens": max_output_tokens,
+        "concurrency": concurrency,
     }
 
 
@@ -547,16 +569,15 @@ async def background_run_wiki(
         recent_merged_mr = mr_ctx["recent_merged_mr"]
 
         # 2. 检查增量基线缓存（非 force 且 commit_sha / 写入提交与 config_hash 一致且文档仍存在则跳过）
-        expected_cfg_hash = stable_digest(
-            {
-                "version": WIKI_VERSION,
-                "locale": settings["locale"],
-                "max_pages": settings["max_pages"],
-                "context_chars": settings["context_chars"],
-                "model": model_name,
-                "wiki_dir": wiki_dir,
-                "subpath": subpath,
-            }
+        expected_cfg_hash = compute_wiki_config_hash(
+            locale=settings["locale"],
+            max_pages=settings["max_pages"],
+            context_chars=settings["context_chars"],
+            max_output_tokens=settings["max_output_tokens"],
+            file_char_limit=settings["file_char_limit"],
+            model_name=model_name,
+            wiki_dir=wiki_dir,
+            subpath=subpath,
         )
         redis = get_redis()
         baseline_key = _baseline_cache_key(project_id, branch, subpath)
@@ -625,6 +646,7 @@ async def background_run_wiki(
             wiki_dir=wiki_dir,
             subpath=subpath,
             max_bytes=settings["max_bytes"],
+            file_char_limit=settings["file_char_limit"],
         )
 
         # 5. 对接 AI 模型与 Redis 断点阶段缓存
@@ -669,6 +691,9 @@ async def background_run_wiki(
             model_name=model_name,
             max_pages=settings["max_pages"],
             context_chars=settings["context_chars"],
+            max_output_tokens=settings["max_output_tokens"],
+            file_char_limit=settings["file_char_limit"],
+            concurrency=settings["concurrency"],
             stage_cache_get=_stage_cache_get,
             stage_cache_set=_stage_cache_set,
             progress_cb=_push_running_card,

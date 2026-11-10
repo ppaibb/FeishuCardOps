@@ -9,9 +9,17 @@ import httpx
 
 from core.card_builder import build_card, build_wiki_card, format_duration
 from core.wiki_engine import (
+    DEFAULT_CONTEXT_CHARS,
+    DEFAULT_FILE_CHAR_LIMIT,
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    build_material,
+    compute_wiki_config_hash,
     generate_wiki_bundle,
     git_blob_sha1,
+    ordered_paths,
     parse_json_result,
+    resolve_adaptive_page_plan,
+    sample_paths_for_overview,
     scan_archive_bytes,
     validate_catalogue,
 )
@@ -24,6 +32,7 @@ from services.repo_wiki import (
     _running_wiki_tasks,
     background_run_wiki,
     cancel_running_wiki,
+    resolve_wiki_settings,
 )
 
 
@@ -186,6 +195,151 @@ class TestWikiScannerAndEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta["repo"]["commit_sha"], "deadbeef1234")
         self.assertEqual(meta["catalogs"][0]["id"], "backend-core")
 
+    def test_adaptive_page_plan_and_settings_parsing(self):
+        # 1. 自适应规模：小/中/大仓平滑扩容，显式固定值保底生效
+        small_plan = resolve_adaptive_page_plan(6, 0)
+        self.assertEqual(small_plan["mode"], "adaptive")
+        self.assertEqual(small_plan["hard_cap"], 6)
+        self.assertLessEqual(small_plan["max_hint"], 4)
+
+        medium_plan = resolve_adaptive_page_plan(80, 0)
+        self.assertEqual(medium_plan["mode"], "adaptive")
+        self.assertEqual((medium_plan["min_hint"], medium_plan["max_hint"], medium_plan["hard_cap"]), (6, 14, 18))
+
+        large_plan = resolve_adaptive_page_plan(400, 0)
+        self.assertEqual(large_plan["mode"], "adaptive")
+        self.assertEqual(large_plan["hard_cap"], 24)
+
+        fixed_plan = resolve_adaptive_page_plan(400, 12)
+        self.assertEqual(fixed_plan["mode"], "fixed")
+        self.assertEqual(fixed_plan["hard_cap"], 12)
+
+        # 2. 服务配置解析：默认启用自适应（max_pages=0）与更高默认预算，且仓库级可覆盖全局
+        default_s = resolve_wiki_settings({})
+        self.assertEqual(default_s["max_pages"], 0)
+        self.assertEqual(default_s["context_chars"], DEFAULT_CONTEXT_CHARS)
+        self.assertEqual(default_s["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS)
+        self.assertEqual(default_s["file_char_limit"], DEFAULT_FILE_CHAR_LIMIT)
+        self.assertEqual(default_s["concurrency"], 3)
+
+        override_s = resolve_wiki_settings(
+            {"wiki": {"max_pages": 6, "concurrency": 2}},
+            {"wiki_max_pages": "auto", "wiki_concurrency": 5},
+        )
+        self.assertEqual(override_s["max_pages"], 0)
+        self.assertEqual(override_s["concurrency"], 5)
+
+    def test_overview_balanced_sampling_and_fair_section_material(self):
+        entries = {
+            "README.md": "# Big Monorepo\n",
+            "package.json": '{"name": "demo"}\n',
+        }
+        # 制造根目录和同一子目录大量文件 + 不同业务子目录
+        for i in range(15):
+            entries[f"docs/note_{i:02d}.md"] = f"# Note {i}\n" + ("x" * 100)
+        entries["src/api/users.ts"] = "export const fetchUsers = () => {};\n" + ("// line\n" * 400)
+        entries["src/views/Dashboard.vue"] = "<template><div>Dash</div></template>\n"
+        entries["services/billing/invoice.py"] = "def create_invoice():\n    return 1\n" + ("x = 1\n" * 1200)
+
+        source = scan_archive_bytes(_make_tar_gz(entries), branch="main", commit_sha="abc999")
+        # 单文件截断默认已放宽至 18,000 字符（超过旧版 6,000 限制）
+        self.assertGreater(len(source["files"]["services/billing/invoice.py"]["text"]), 6000)
+
+        paths = ordered_paths(source)
+        sampled = sample_paths_for_overview(paths)
+        # 入口清单最先，且每个目录第一批样本都能排在大量同类 docs/note_XX 之前
+        self.assertEqual(sampled[:2], ["README.md", "package.json"])
+        first_ten = set(sampled[:10])
+        self.assertIn("src/api/users.ts", first_ten)
+        self.assertIn("src/views/Dashboard.vue", first_ten)
+        self.assertIn("services/billing/invoice.py", first_ten)
+
+        # 专题 fair_share=True 不让前几个大文件饿死后面的文件
+        mat = build_material(
+            source,
+            ["services/billing/invoice.py", "src/api/users.ts", "src/views/Dashboard.vue"],
+            budget=16000,
+            file_char_limit=18000,
+            fair_share=True,
+        )
+        self.assertEqual(len(mat["sources"]), 3)
+        self.assertEqual(mat["omitted_from_context"], [])
+
+    async def test_adaptive_concurrent_wiki_generation_scales_beyond_four_topics(self):
+        entries = {"README.md": "# Large Demo\n"}
+        section_defs = []
+        for idx in range(1, 7):
+            fpath = f"modules/mod_{idx}/core.py"
+            entries[fpath] = f"def handle_{idx}():\n    return {idx}\n"
+            section_defs.append(
+                {
+                    "id": f"mod-{idx}",
+                    "title": f"业务域 {idx}",
+                    "goal": f"解析模块 {idx}",
+                    "files": [fpath],
+                }
+            )
+        source = scan_archive_bytes(_make_tar_gz(entries), branch="main", commit_sha="multi123")
+
+        in_flight = 0
+        max_in_flight = 0
+
+        async def concurrent_llm(purpose, instructions, ctx):
+            nonlocal in_flight, max_in_flight
+            if purpose == "wiki.overview":
+                return "# 架构总览\n\n核心说明见 `README.md:1`。" + ("补充总览证据分析。\n" * 10)
+            if purpose == "wiki.catalogue":
+                self.assertIn("page_plan", ctx)
+                self.assertEqual(ctx["page_plan"]["mode"], "adaptive")
+                return json.dumps({"sections": section_defs}, ensure_ascii=False)
+            if purpose == "wiki.page":
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+                try:
+                    sec_id = ctx["section"]["id"]
+                    idx = int(sec_id.split("-")[1])
+                    # 刻意让序号靠前的专题完成更慢，检验输出严格保持目录声明顺序
+                    await asyncio.sleep(0.01 * (7 - idx))
+                    fpath = ctx["section"]["files"][0]
+                    return f"# {ctx['section']['title']}\n\n实现位于 `{fpath}:1`。" + ("详尽解析调用流与接口。\n" * 10)
+                finally:
+                    in_flight -= 1
+            if purpose == "cards.module":
+                fpath = ctx["section"]["files"][0]
+                return json.dumps(
+                    {
+                        "cards": [
+                            {
+                                "type": "overview",
+                                "title": "模块概览",
+                                "content": f"# 模块概览\n\n核心代码位于 `{fpath}:1`，封装模块独立业务逻辑与对外接口契约，职责边界清晰并支持并发分析处理与自动化文档校验。",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            raise AssertionError(purpose)
+
+        progress_msgs = []
+
+        async def record_progress(msg):
+            progress_msgs.append(msg)
+
+        bundle = await generate_wiki_bundle(
+            source=source,
+            repo_name="foundation/multi",
+            model_call=concurrent_llm,
+            max_pages=0,  # 自适应模式
+            concurrency=3,
+            progress_cb=record_progress,
+        )
+
+        # 突破旧版 4 篇限制（1 README + 6 专题 = 7 篇），且顺序严格保序
+        self.assertEqual(bundle["pages_count"], 7)
+        self.assertEqual([t["id"] for t in bundle["topics"]], [f"mod-{i}" for i in range(1, 7)])
+        self.assertGreaterEqual(max_in_flight, 2)
+        self.assertTrue(any("已完成 `6/6`" in m for m in progress_msgs))
+
 
 class TestGitLabWritebackAndFallback(unittest.IsolatedAsyncioTestCase):
     def test_compute_commit_actions_respects_blob_sha_and_deletes_stale(self):
@@ -343,18 +497,15 @@ class TestWikiSkipCacheAndFeishuUI(unittest.IsolatedAsyncioTestCase):
             "cards_count": 8,
             "doc_url": "https://gitlab.example.com/docs/README.md",
         }
-        from core.wiki_engine import WIKI_VERSION, stable_digest
-
-        cached_baseline["config_hash"] = stable_digest(
-            {
-                "version": WIKI_VERSION,
-                "locale": "zh-CN",
-                "max_pages": 4,
-                "context_chars": 24000,
-                "model": "MiniMax-M2.7",
-                "wiki_dir": "docs/repowiki",
-                "subpath": "",
-            }
+        cached_baseline["config_hash"] = compute_wiki_config_hash(
+            locale="zh-CN",
+            max_pages=0,
+            context_chars=DEFAULT_CONTEXT_CHARS,
+            max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+            file_char_limit=DEFAULT_FILE_CHAR_LIMIT,
+            model_name="MiniMax-M2.7",
+            wiki_dir="docs/repowiki",
+            subpath="",
         )
         mock_redis.get.return_value = json.dumps(cached_baseline)
         mock_get_redis.return_value = mock_redis

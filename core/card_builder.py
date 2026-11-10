@@ -729,9 +729,12 @@ def build_wiki_card(
 
         topics = result.get("topics") or []
         if topics:
-            topic_lines = ["**📑 已生成专题目录**"]
-            for idx, t in enumerate(topics, 1):
+            shown_topics = topics[:20]
+            topic_lines = [f"**📑 已生成专题目录（共 {len(topics)} 篇）**"]
+            for idx, t in enumerate(shown_topics, 1):
                 topic_lines.append(f"{idx}. **{t.get('title', t.get('id', '专题'))}** — `{t.get('path', '')}`")
+            if len(topics) > len(shown_topics):
+                topic_lines.append(f"…… 其余 {len(topics) - len(shown_topics)} 篇请点击下方「📖 查看 GitLab 文档」浏览完整目录")
             detail_sections.append("\n".join(topic_lines))
 
     if w_status == "failed" and error_info:

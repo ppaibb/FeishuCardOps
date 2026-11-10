@@ -24,12 +24,16 @@ import anthropic
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
-WIKI_VERSION = "repowiki-1.0.0"
+WIKI_VERSION = "repowiki-1.1.0"
 DEFAULT_WIKI_DIR = "docs/repowiki"
-DEFAULT_MAX_PAGES = 4
-DEFAULT_CONTEXT_CHARS = 24000
-DEFAULT_MAX_BYTES = 200000
-DEFAULT_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_MAX_PAGES = 0  # 0 / "auto" 表示按仓库模块规模自适应规划
+MAX_PAGES_SAFETY_CAP = 24
+MAX_PAGES_HARD_CEILING = 30
+DEFAULT_CONTEXT_CHARS = 96000
+DEFAULT_FILE_CHAR_LIMIT = 18000
+DEFAULT_MAX_BYTES = 300000
+DEFAULT_MAX_OUTPUT_TOKENS = 8192
+DEFAULT_PAGE_CONCURRENCY = 3
 
 IGNORED_DIRS = {
     ".git",
@@ -134,6 +138,7 @@ def scan_archive_bytes(
     subpath: str = "",
     max_files: int = 0,
     max_bytes: int = DEFAULT_MAX_BYTES,
+    file_char_limit: int = DEFAULT_FILE_CHAR_LIMIT,
     strip_top_dir: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -198,10 +203,11 @@ def scan_archive_bytes(
             omitted.append({"path": rel, "reason": "max_files limit reached"})
             continue
 
+        char_limit = max(2000, int(file_char_limit or DEFAULT_FILE_CHAR_LIMIT))
         records[rel] = {
             "sha256": hashlib.sha256(raw).hexdigest(),
-            "text": text[:6000],
-            "text_truncated": len(text) > 6000,
+            "text": text[:char_limit],
+            "text_truncated": len(text) > char_limit,
             "bytes": len(raw),
         }
 
@@ -222,11 +228,166 @@ def scan_archive_bytes(
     }
 
 
+_KEY_MANIFEST_NAMES = {
+    "readme",
+    "package.json",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "go.mod",
+    "pyproject.toml",
+    "setup.py",
+    "cargo.toml",
+    "dockerfile",
+    "makefile",
+    "jenkinsfile",
+    ".gitlab-ci.yml",
+    "tsconfig.json",
+    "application.yml",
+    "application.yaml",
+    "application.properties",
+}
+
+_KEY_ENTRYPOINT_STEMS = {
+    "main",
+    "app",
+    "index",
+    "server",
+    "router",
+    "routes",
+    "urls",
+    "wsgi",
+    "asgi",
+    "cli",
+    "store",
+    "bootstrap",
+    "config",
+    "settings",
+}
+
+
+def compute_wiki_config_hash(
+    *,
+    locale: str = "zh-CN",
+    max_pages: Any = DEFAULT_MAX_PAGES,
+    context_chars: int = DEFAULT_CONTEXT_CHARS,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    file_char_limit: int = DEFAULT_FILE_CHAR_LIMIT,
+    model_name: str = "",
+    wiki_dir: str = DEFAULT_WIKI_DIR,
+    subpath: str = "",
+) -> str:
+    """统一计算 RepoWiki 生成配置的稳定指纹，供引擎与基线缓存共享。"""
+    try:
+        parsed_pages = int(max_pages) if max_pages is not None else 0
+    except (TypeError, ValueError):
+        parsed_pages = 0
+    normalized_pages: Any = "auto" if parsed_pages <= 0 else parsed_pages
+    return stable_digest(
+        {
+            "version": WIKI_VERSION,
+            "locale": locale,
+            "max_pages": normalized_pages,
+            "context_chars": int(context_chars),
+            "max_output_tokens": int(max_output_tokens),
+            "file_char_limit": int(file_char_limit),
+            "model": model_name,
+            "wiki_dir": wiki_dir.strip("/") or DEFAULT_WIKI_DIR,
+            "subpath": subpath.strip("/") if subpath else "",
+        }
+    )
+
+
+def resolve_adaptive_page_plan(eligible_files: int, max_pages: Optional[int] = 0) -> Dict[str, Any]:
+    """根据仓库源码规模计算自适应专题规划建议与安全熔断上限。"""
+    try:
+        requested = int(max_pages) if max_pages is not None else 0
+    except (TypeError, ValueError):
+        requested = 0
+
+    if requested > 0:
+        capped = min(requested, MAX_PAGES_HARD_CEILING)
+        return {
+            "mode": "fixed",
+            "requested": requested,
+            "min_hint": 1,
+            "max_hint": capped,
+            "hard_cap": capped,
+        }
+
+    count = max(0, int(eligible_files or 0))
+    if count <= 12:
+        min_hint, max_hint, hard_cap = 1, max(1, min(count, 4)), 6
+    elif count <= 40:
+        min_hint, max_hint, hard_cap = 3, 8, 12
+    elif count <= 120:
+        min_hint, max_hint, hard_cap = 6, 14, 18
+    elif count <= 300:
+        min_hint, max_hint, hard_cap = 8, 18, MAX_PAGES_SAFETY_CAP
+    else:
+        min_hint, max_hint, hard_cap = 10, 22, MAX_PAGES_SAFETY_CAP
+
+    return {
+        "mode": "adaptive",
+        "requested": 0,
+        "min_hint": min_hint,
+        "max_hint": max_hint,
+        "hard_cap": hard_cap,
+    }
+
+
 def ordered_paths(source: Dict[str, Any]) -> List[str]:
     return sorted(
         source["files"].keys(),
         key=lambda p: (not PurePosixPath(p).name.lower().startswith("readme"), p.count("/"), p),
     )
+
+
+def sample_paths_for_overview(paths: List[str]) -> List[str]:
+    """
+    为总览与目录规划阶段生成均衡采样顺序：
+    1. 优先保留清单文件与浅层核心入口；
+    2. 对其余文件按顶级/二级目录轮询抽样，避免根目录配置耗尽上下文而漏掉深层业务模块。
+    """
+    priority: List[str] = []
+    buckets: Dict[str, List[str]] = {}
+
+    for rel in paths:
+        p = PurePosixPath(rel)
+        name_lower = p.name.lower()
+        stem_lower = p.stem.lower()
+        is_manifest = (
+            name_lower.startswith("readme")
+            or name_lower in _KEY_MANIFEST_NAMES
+            or name_lower.startswith(("docker-compose", "vite.config.", "vue.config.", "nuxt.config."))
+        )
+        is_shallow_entry = stem_lower in _KEY_ENTRYPOINT_STEMS and rel.count("/") <= 2
+        if is_manifest or is_shallow_entry:
+            priority.append(rel)
+        else:
+            parts = p.parts
+            if len(parts) >= 3:
+                bucket = f"{parts[0]}/{parts[1]}"
+            elif len(parts) == 2:
+                bucket = parts[0]
+            else:
+                bucket = "_root"
+            buckets.setdefault(bucket, []).append(rel)
+
+    ordered: List[str] = list(priority)
+    bucket_keys = sorted(buckets.keys())
+    for k in bucket_keys:
+        buckets[k].sort(key=lambda item: (item.count("/"), item))
+
+    max_depth = max((len(buckets[k]) for k in bucket_keys), default=0)
+    for idx in range(max_depth):
+        for k in bucket_keys:
+            items = buckets[k]
+            if idx < len(items):
+                ordered.append(items[idx])
+    return ordered
 
 
 def bounded_inventory(paths: List[str], budget: int) -> List[str]:
@@ -240,23 +401,38 @@ def bounded_inventory(paths: List[str], budget: int) -> List[str]:
     return selected
 
 
-def build_material(source: Dict[str, Any], paths: List[str], budget: int) -> Dict[str, Any]:
+def build_material(
+    source: Dict[str, Any],
+    paths: List[str],
+    budget: int,
+    file_char_limit: int = DEFAULT_FILE_CHAR_LIMIT,
+    fair_share: bool = False,
+) -> Dict[str, Any]:
     """为指定文件组装带真实行号的有界源码片段，并显式标明被裁剪文件。"""
+    unique_paths = [p for p in dict.fromkeys(paths) if p in source["files"]]
     selected: List[Dict[str, Any]] = []
     missing: List[str] = []
     remaining = budget
-    for path in dict.fromkeys(paths):
-        if path not in source["files"]:
-            continue
+    max_single_file = max(2000, int(file_char_limit or DEFAULT_FILE_CHAR_LIMIT))
+    total_count = len(unique_paths)
+
+    for idx, path in enumerate(unique_paths):
         if remaining < 100:
             missing.append(path)
             continue
-        cap = min(6000, remaining)
+        rem_files = max(1, total_count - idx)
+        if fair_share:
+            share_budget = max(remaining // rem_files, min(2000, remaining))
+            cap = min(max_single_file, remaining, share_budget)
+        else:
+            diverse_window = min(rem_files, 12)
+            cap = min(max_single_file, remaining, max(3000, remaining // diverse_window))
+
         lines: List[str] = []
         used = 0
         original = source["files"][path]["text"].splitlines()
-        for idx, line in enumerate(original, 1):
-            item = f"{idx}: {line}"
+        for line_no, line in enumerate(original, 1):
+            item = f"{line_no}: {line}"
             if used + len(item) + 1 > cap:
                 break
             lines.append(item)
@@ -311,12 +487,17 @@ def _normalize_slug(raw_id: Any, index: int, seen: set) -> str:
     return slug
 
 
-def validate_catalogue(value: Any, valid_files: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
+def validate_catalogue(
+    value: Any,
+    valid_files: Dict[str, Any],
+    max_pages: int = MAX_PAGES_SAFETY_CAP,
+) -> List[Dict[str, Any]]:
+    cap = MAX_PAGES_SAFETY_CAP if not max_pages or max_pages <= 0 else min(int(max_pages), MAX_PAGES_HARD_CEILING)
     sections = value.get("sections") if isinstance(value, dict) else None
     if not isinstance(sections, list) or not sections:
-        raise ValueError(f"Catalogue must contain 1..{max_pages} sections")
-    if len(sections) > max_pages:
-        sections = sections[:max_pages]
+        raise ValueError(f"Catalogue must contain 1..{cap} sections")
+    if len(sections) > cap:
+        sections = sections[:cap]
 
     normalized: List[Dict[str, Any]] = []
     seen_ids: set = set()
@@ -391,7 +572,7 @@ class AnthropicWikiModel:
         model: str,
         locale: str = "zh-CN",
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
-        timeout: float = 180.0,
+        timeout: float = 240.0,
     ):
         self.api_key = api_key
         self.base_url = base_url
@@ -596,29 +777,39 @@ async def generate_wiki_bundle(
     model_name: str = "",
     max_pages: int = DEFAULT_MAX_PAGES,
     context_chars: int = DEFAULT_CONTEXT_CHARS,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    file_char_limit: int = DEFAULT_FILE_CHAR_LIMIT,
+    concurrency: int = DEFAULT_PAGE_CONCURRENCY,
     stage_cache_get: Optional[Callable[[str, str, str], Awaitable[Optional[Any]]]] = None,
     stage_cache_set: Optional[Callable[[str, str, str, Any], Awaitable[None]]] = None,
     progress_cb: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> Dict[str, Any]:
     """
-    执行完整的「总览 -> 目录规划 -> 专题正文 -> 知识卡片」异步生成与校验管线。
+    执行完整的「总览 -> 自适应目录规划 -> 并发专题正文 -> 知识卡片」异步生成与校验管线。
     """
-    config_hash = stable_digest(
-        {
-            "version": WIKI_VERSION,
-            "locale": locale,
-            "max_pages": max_pages,
-            "context_chars": context_chars,
-            "model": model_name,
-            "wiki_dir": wiki_dir.strip("/") or DEFAULT_WIKI_DIR,
-            "subpath": source.get("subpath") or "",
-        }
+    config_hash = compute_wiki_config_hash(
+        locale=locale,
+        max_pages=max_pages,
+        context_chars=context_chars,
+        max_output_tokens=max_output_tokens,
+        file_char_limit=file_char_limit,
+        model_name=model_name,
+        wiki_dir=wiki_dir,
+        subpath=source.get("subpath") or "",
     )
 
     paths = ordered_paths(source)
-    inventory = bounded_inventory(paths, max(context_chars // 3, 2000))
-    if not inventory:
+    sampled_paths = sample_paths_for_overview(paths)
+    inventory_budget = max(min(context_chars // 2, 48000), 4000)
+    selected_inventory = bounded_inventory(sampled_paths, inventory_budget)
+    if not selected_inventory:
         raise ValueError("上下文预算不足，无法容纳代码文件清单")
+    inventory = paths if len(selected_inventory) >= len(paths) else sorted(selected_inventory)
+    inventory_set = set(inventory)
+    sampled_for_context = [p for p in sampled_paths if p in inventory_set]
+    sources_budget = max(context_chars - len(stable_encode(inventory)), max(context_chars * 2 // 3, 4000))
+
+    page_plan = resolve_adaptive_page_plan(len(paths), max_pages)
 
     shared = {
         "repository": repo_name,
@@ -632,7 +823,13 @@ async def generate_wiki_bundle(
             "inventory_paths_shown": len(inventory),
             "inventory_paths_omitted": len(paths) - len(inventory),
         },
-        **build_material(source, inventory, max(context_chars * 2 // 3, 4000)),
+        **build_material(
+            source,
+            sampled_for_context,
+            sources_budget,
+            file_char_limit=file_char_limit,
+            fair_share=False,
+        ),
     }
 
     async def run_stage(
@@ -671,7 +868,7 @@ async def generate_wiki_bundle(
                 await asyncio.sleep(min(2 * attempt, 5))
 
     if progress_cb:
-        await progress_cb(f"🔍 已扫描 {len(paths)} 个源码文件，正在生成全局仓库总览...")
+        await progress_cb(f"🔍 已扫描 `{len(paths)}` 个源码文件，正在生成全局架构总览...")
 
     overview_sig = stable_digest([config_hash, source["fingerprint"]])
     overview_md = await run_stage(
@@ -681,9 +878,14 @@ async def generate_wiki_bundle(
         lambda err: model_call(
             "wiki.overview",
             (
-                "Return only Markdown with repository purpose, observed architecture/modules, "
-                "tech stack, entrypoints, evidence citations formatted as path:line, and unknowns. "
-                "Minimum 200 UTF-8 bytes. Start directly with `#` heading."
+                "Return ONLY Markdown starting directly with a `#` heading. "
+                "Write a comprehensive architectural overview grounded ONLY in `inventory` and `sources`, covering: "
+                "1) repository purpose & core capabilities; "
+                "2) overall architecture & directory topology (include a concise Mermaid or ASCII diagram of observed modules); "
+                "3) tech stack & core dependencies matrix (Markdown table); "
+                "4) entrypoints, build/startup/CI pipeline & configuration system; "
+                "5) module index & explicit unknowns for omitted/truncated files. "
+                "Cite exact paths and line numbers (`path:line`). Expand thoroughly based on evidence. Minimum 200 UTF-8 bytes."
             ),
             {**shared, "validation_feedback": err},
         ),
@@ -692,21 +894,32 @@ async def generate_wiki_bundle(
     )
 
     if progress_cb:
-        await progress_cb("🧭 全局总览已完成，正在规划 RepoWiki 专题目录...")
+        await progress_cb("🧭 全局总览已完成，正在按仓库模块复杂度规划专题目录...")
 
     catalogue_sig = stable_digest([config_hash, source["fingerprint"], overview_md])
+    if page_plan["mode"] == "adaptive":
+        catalogue_instruction = (
+            'Return ONLY a raw JSON object: {"sections":[{"id":"safe-slug","title":"...","goal":"...","files":["existing/path"]}]}. '
+            "Analyze the full `inventory` and `sources` and partition ALL major functional modules, business domains, and architectural layers into cohesive documentation topics. "
+            f"Scale naturally with repository complexity: for {len(paths)} source files, aim for roughly {page_plan['min_hint']}..{page_plan['max_hint']} well-scoped topics (safety ceiling: {page_plan['hard_cap']}). "
+            "Do not force trivial single files into standalone topics, and do not omit major directories or compress distinct subsystems together just to reduce count. "
+            "Include all directly related core files from `inventory` in each topic's `files` array (only exact paths from `inventory`). "
+            "IDs must be unique ASCII lowercase slugs (`overview` is reserved). Do not wrap output in explanations."
+        )
+    else:
+        catalogue_instruction = (
+            'Return ONLY a raw JSON object: {"sections":[{"id":"safe-slug","title":"...","goal":"...","files":["existing/path"]}]}. '
+            f"Plan 1..{page_plan['hard_cap']} coherent architectural topics covering key parts of the repo. "
+            "IDs must be unique ASCII lowercase slugs (`overview` is reserved). "
+            "Each `files` list must be non-empty and contain ONLY exact paths from `inventory`. "
+            "Do not wrap output in explanations."
+        )
 
     async def _produce_catalogue(err: str) -> Any:
         raw = await model_call(
             "wiki.catalogue",
-            (
-                f'Return ONLY a raw JSON object: {{"sections":[{{"id":"safe-slug","title":"...","goal":"...","files":["existing/path"]}}]}}. '
-                f"Plan 1..{max_pages} coherent architectural topics covering key parts of the repo. "
-                "IDs must be unique ASCII lowercase slugs (`overview` is reserved). "
-                "Each `files` list must be non-empty and contain ONLY exact paths from `inventory`. "
-                "Do not wrap output in explanations."
-            ),
-            {**shared, "overview": overview_md, "validation_feedback": err},
+            catalogue_instruction,
+            {**shared, "overview": overview_md, "page_plan": page_plan, "validation_feedback": err},
         )
         return parse_json_result(raw)
 
@@ -715,64 +928,120 @@ async def generate_wiki_bundle(
         "repo",
         catalogue_sig,
         _produce_catalogue,
-        lambda val: validate_catalogue(val, source["files"], max_pages),
+        lambda val: validate_catalogue(val, source["files"], page_plan["hard_cap"]),
         attempts=2,
     )
 
-    pages: List[Dict[str, Any]] = []
-    card_groups: List[Tuple[Dict[str, Any], List[Dict[str, str]]]] = []
+    total_sections = len(sections)
+    worker_limit = max(1, min(int(concurrency or DEFAULT_PAGE_CONCURRENCY), total_sections))
+    sem = asyncio.Semaphore(worker_limit)
+    progress_lock = asyncio.Lock()
+    active_titles: Dict[int, str] = {}
+    done_count = 0
 
-    for idx, sec in enumerate(sections, 1):
-        if progress_cb:
-            await progress_cb(f"✍️ 正在编写专题 {idx}/{len(sections)}：{sec['title']}...")
+    async def _emit_section_progress() -> None:
+        if not progress_cb:
+            return
+        async with progress_lock:
+            running = [active_titles[k] for k in sorted(active_titles)]
+            if running:
+                preview = "、".join(f"《{t}》" for t in running[:3])
+                if len(running) > 3:
+                    preview += f" 等 {len(running)} 篇"
+                msg = f"✍️ 正在并发撰写专题（已完成 `{done_count}/{total_sections}`，进行中：{preview}）..."
+            else:
+                msg = f"✍️ 专题撰写进度：已完成 `{done_count}/{total_sections}`..."
+            await progress_cb(msg)
 
+    async def _process_section(idx: int, sec: Dict[str, Any]) -> Tuple[Dict[str, Any], Tuple[Dict[str, Any], List[Dict[str, str]]]]:
+        nonlocal done_count
         page_sig = stable_digest([config_hash, sec, overview_md, {p: source["manifest"][p] for p in sec["files"]}])
-        sec_context = {"section": sec, "overview": overview_md, **build_material(source, sec["files"], context_chars)}
+        sec_context = {
+            "section": sec,
+            "overview": overview_md,
+            **build_material(
+                source,
+                sec["files"],
+                context_chars,
+                file_char_limit=file_char_limit,
+                fair_share=True,
+            ),
+        }
 
-        page_md = await run_stage(
-            "page",
-            sec["id"],
-            page_sig,
-            lambda err, ctx=sec_context: model_call(
+        async def _produce_page(err: str, ctx: Dict[str, Any] = sec_context) -> str:
+            return await model_call(
                 "wiki.page",
                 (
-                    "Return only Markdown starting with `#`. Describe responsibilities, interfaces, key data/control flows, "
-                    "and configuration only when directly observed in `sources`. Cite exact source paths and line numbers (`path:line`). "
-                    "Explicitly list unknowns for anything omitted or truncated. Minimum 250 UTF-8 bytes."
-                ),
-                {**ctx, "validation_feedback": err},
-            ),
-            lambda text, sec_files=sec["files"]: validate_markdown(text, sec_files, minimum=250),
-            attempts=2,
-        )
-        pages.append({**sec, "content": page_md})
-
-        card_sig = stable_digest([page_sig, page_md])
-        card_ctx = {**sec_context, "wiki_page": page_md}
-
-        async def _produce_cards(err: str, ctx: Dict[str, Any] = card_ctx) -> Any:
-            raw = await model_call(
-                "cards.module",
-                (
-                    'Return ONLY a raw JSON object: {"cards":[{"type":"overview","title":"...","content":"# Heading\\n..."}]}. '
-                    "Create 1..4 concise standalone knowledge cards using distinct `type` values from: "
-                    "`overview`, `architecture_design`, `tech_stack`, `coding_conventions`. "
-                    "Every card's `content` must start with `#`, contain at least 120 UTF-8 bytes, and cite supplied source paths. "
-                    "Omit any type lacking direct evidence."
+                    "Return ONLY Markdown starting directly with `#`. Write an in-depth, engineering-grade technical document "
+                    "grounded ONLY in `sources` and `overview`, covering: "
+                    "1) responsibilities & module boundaries; "
+                    "2) core files & key symbols/classes/functions (use Markdown table: path, symbols, responsibility); "
+                    "3) control/data flow, state transitions & internal interactions (include a Mermaid flowchart or sequenceDiagram when directly evidenced); "
+                    "4) exposed APIs/interfaces/events/configs observed (use tables where appropriate); "
+                    "5) constraints, error handling, edge cases & explicit unknowns for truncated/omitted files. "
+                    "Cite exact source paths and line numbers (`path:line`). Be thorough and detailed. Minimum 250 UTF-8 bytes."
                 ),
                 {**ctx, "validation_feedback": err},
             )
-            return parse_json_result(raw)
 
-        cards = await run_stage(
-            "cards",
-            sec["id"],
-            card_sig,
-            _produce_cards,
-            lambda val, sec_files=sec["files"]: validate_cards(val, sec_files),
-            attempts=3,
-        )
-        card_groups.append((sec, cards))
+        async with sem:
+            active_titles[idx] = sec["title"]
+            await _emit_section_progress()
+            try:
+                page_md = await run_stage(
+                    "page",
+                    sec["id"],
+                    page_sig,
+                    _produce_page,
+                    lambda text, sec_files=sec["files"]: validate_markdown(text, sec_files, minimum=250),
+                    attempts=2,
+                )
+
+                card_sig = stable_digest([page_sig, page_md])
+                card_ctx = {**sec_context, "wiki_page": page_md}
+
+                async def _produce_cards(err: str, ctx: Dict[str, Any] = card_ctx) -> Any:
+                    raw = await model_call(
+                        "cards.module",
+                        (
+                            'Return ONLY a raw JSON object: {"cards":[{"type":"overview","title":"...","content":"# Heading\\n..."}]}. '
+                            "Create 1..4 high-density standalone knowledge cards using distinct `type` values from: "
+                            "`overview`, `architecture_design`, `tech_stack`, `coding_conventions`. "
+                            "Every card's `content` must start with `#`, cite supplied source paths (`path:line` where visible), "
+                            "and summarize concrete mechanisms, patterns, interfaces or conventions (at least 120 UTF-8 bytes). "
+                            "Omit any type lacking direct evidence."
+                        ),
+                        {**ctx, "validation_feedback": err},
+                    )
+                    return parse_json_result(raw)
+
+                cards = await run_stage(
+                    "cards",
+                    sec["id"],
+                    card_sig,
+                    _produce_cards,
+                    lambda val, sec_files=sec["files"]: validate_cards(val, sec_files),
+                    attempts=3,
+                )
+            finally:
+                active_titles.pop(idx, None)
+
+            done_count += 1
+            await _emit_section_progress()
+            return ({**sec, "content": page_md}, (sec, cards))
+
+    tasks = [asyncio.create_task(_process_section(idx, sec)) for idx, sec in enumerate(sections, 1)]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    pages: List[Dict[str, Any]] = [item[0] for item in results]
+    card_groups: List[Tuple[Dict[str, Any], List[Dict[str, str]]]] = [item[1] for item in results]
 
     bundle = render_wiki_bundle(
         repo_name=repo_name,
