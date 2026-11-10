@@ -549,7 +549,12 @@ async def feishu_card(request: Request):
         asyncio.create_task(
             background_run_wiki(feishu_client, gitlab, cfg, state, operator_open_id, open_chat_id, lock_scope)
         )
-        return JSONResponse({"toast": {"type": "info", "content": "📚 已启动 RepoWiki 生成！进度卡片稍后发出..."}})
+        return JSONResponse({
+            "toast": {
+                "type": "info",
+                "content": "📚 已启动 RepoWiki 生成！若当前分支有活跃 MR 将写回 MR 源分支协同评审，进度卡片稍后发出...",
+            }
+        })
 
     # ── 执行发版 ─────────────────────────────────────────────────
     if action_name == "run":

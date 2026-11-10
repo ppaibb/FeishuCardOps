@@ -584,13 +584,22 @@ def build_wiki_card(
     commit_ref = f"[`{short_sha}`]({commit_url})" if commit_url and short_sha != "-" else f"`{short_sha}`"
 
     write_mode = result.get("write_mode", "")
+    active_mr = result.get("active_mr") if isinstance(result.get("active_mr"), dict) and (result.get("active_mr") or {}).get("iid") else None
+    recent_merged_mr = (
+        result.get("recent_merged_mr")
+        if isinstance(result.get("recent_merged_mr"), dict) and (result.get("recent_merged_mr") or {}).get("iid")
+        else None
+    )
     elapsed_sec = result.get("elapsed_seconds")
     elapsed_display = format_duration(elapsed_sec) if isinstance(elapsed_sec, (int, float)) else ""
 
     if w_status == "running":
         header_color = "blue"
         header_title = "⏳ RepoWiki 生成中..."
-        intro = f"<at id=\"{operator_open_id}\"></at> **正在分析源码并生成 RepoWiki 文档...**"
+        if active_mr:
+            intro = f"<at id=\"{operator_open_id}\"></at> **正在分析 MR !{active_mr['iid']} 源分支并生成 RepoWiki 文档...**"
+        else:
+            intro = f"<at id=\"{operator_open_id}\"></at> **正在分析源码并生成 RepoWiki 文档...**"
     elif w_status == "skipped":
         header_color = "green"
         header_title = "⚡ RepoWiki 已是最新版本"
@@ -607,6 +616,11 @@ def build_wiki_card(
             header_color = "green"
             header_title = "🔀 RepoWiki 已生成并提交 Merge Request"
             intro = f"<at id=\"{operator_open_id}\"></at> **RepoWiki 生成完成！由于目标分支受保护，已自动切出文档分支并创建 MR** 🎉"
+        elif active_mr and write_mode == "direct":
+            header_color = "green"
+            header_title = "🔀 RepoWiki 已生成并写入活跃 MR"
+            am_tgt = active_mr.get("target_branch") or "目标分支"
+            intro = f"<at id=\"{operator_open_id}\"></at> **RepoWiki 已写回 MR !{active_mr['iid']} 源分支 `{branch}`，可随功能代码在同一个 MR 里一起评审并合入 `{am_tgt}`！** 🎉"
         else:
             header_color = "green"
             header_title = "✅ RepoWiki 生成并写回成功"
@@ -622,6 +636,25 @@ def build_wiki_card(
         f"**项目**：{project_name} - {repo_name}",
         f"**目标分支**：`{branch}`{subpath_line}　|　**基线提交**：{commit_ref}",
     ]
+
+    if active_mr:
+        am_iid = active_mr["iid"]
+        am_url = str(active_mr.get("web_url") or "").strip()
+        am_title = _sanitize_feishu_md(str(active_mr.get("title") or ""), max_len=50)
+        am_src = active_mr.get("source_branch") or branch
+        am_tgt = active_mr.get("target_branch") or "-"
+        am_link = f"[!{am_iid}]({am_url})" if am_url else f"!{am_iid}"
+        changed_cnt = active_mr.get("changed_files_count")
+        cnt_part = f" · 变更 `{changed_cnt}` 个文件" if isinstance(changed_cnt, int) else ""
+        mr_desc = f"{am_link} {am_title}".strip()
+        summary_lines.append(f"**关联 MR**：{mr_desc}（`{am_src}` → `{am_tgt}`{cnt_part}）")
+    elif recent_merged_mr:
+        rm_iid = recent_merged_mr["iid"]
+        rm_url = str(recent_merged_mr.get("web_url") or "").strip()
+        rm_link = f"[!{rm_iid}]({rm_url})" if rm_url else f"!{rm_iid}"
+        summary_lines.append(f"**运行模式**：🌿 单分支模式（暂无活跃 MR，近期合入：{rm_link}）")
+    elif w_status == "running":
+        summary_lines.append("**运行模式**：🌿 单分支模式（当前分支暂无活跃 MR）")
 
     if w_status == "running":
         summary_lines.append(f"**⏱️ 使用时间**：`{elapsed_display or '0.0秒'}`")
@@ -672,7 +705,22 @@ def build_wiki_card(
                 f"• **写回方式**：🛡️ 保护分支自动降级 → 已推送分支 `{write_branch}` 并提交 MR **{mr_label}** {reused_tip}"
             )
         elif write_mode == "no_diff":
-            stats_lines.append(f"• **写回方式**：⚡ 仓库 `{branch}` 已有完全一致文档内容，跳过空提交")
+            if active_mr:
+                am_iid = active_mr["iid"]
+                am_url = str(active_mr.get("web_url") or "").strip()
+                am_link = f"[!{am_iid}]({am_url})" if am_url else f"!{am_iid}"
+                stats_lines.append(f"• **写回方式**：⚡ MR {am_link} 源分支 `{branch}` 已有完全一致文档内容，跳过空提交")
+            else:
+                stats_lines.append(f"• **写回方式**：⚡ 仓库 `{branch}` 已有完全一致文档内容，跳过空提交")
+        elif active_mr:
+            am_iid = active_mr["iid"]
+            am_url = str(active_mr.get("web_url") or "").strip()
+            am_link = f"[!{am_iid}]({am_url})" if am_url else f"!{am_iid}"
+            am_tgt = active_mr.get("target_branch") or "目标分支"
+            c_part = f"（提交 `{new_commit_short}`，含 `[skip ci]`）" if new_commit_short else "（含 `[skip ci]`）"
+            stats_lines.append(
+                f"• **写回方式**：🔀 已直接写回 MR {am_link} 源分支 `{write_branch}` {c_part}，可随 MR 一起评审合入 `{am_tgt}`"
+            )
         else:
             c_part = f"（提交 `{new_commit_short}`，含 `[skip ci]`）" if new_commit_short else "（含 `[skip ci]`）"
             stats_lines.append(f"• **写回方式**：✅ 已直接提交至分支 `{write_branch}` {c_part}")
@@ -717,6 +765,7 @@ def build_wiki_card(
         })
     elif w_status in {"success", "skipped"}:
         mr_url = str(result.get("mr_url") or "").strip()
+        active_mr_url = str((active_mr or {}).get("web_url") or "").strip()
         doc_url = str(result.get("doc_url") or "").strip()
         write_commit_url = str(result.get("write_commit_url") or "").strip()
 
@@ -726,6 +775,13 @@ def build_wiki_card(
                 "text": {"tag": "plain_text", "content": "🔀 查看 Merge Request"},
                 "type": "primary",
                 "url": mr_url,
+            })
+        if active_mr_url and active_mr_url != mr_url:
+            action_buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": f"🔀 查看 MR !{active_mr['iid']}"},
+                "type": "primary" if not action_buttons else "default",
+                "url": active_mr_url,
             })
         if doc_url:
             action_buttons.append({
@@ -1310,6 +1366,18 @@ def build_card(
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": "📚 生成 Wiki"},
                 "value": {**action_base_val, "action": "repo_wiki"},
+                "confirm": {
+                    "title": {"tag": "plain_text", "content": "📚 生成 RepoWiki 确认"},
+                    "text": {
+                        "tag": "plain_text",
+                        "content": (
+                            "即将分析当前选中分支并生成 RepoWiki 代码知识库：\n\n"
+                            "• 当选中的开发分支存在活跃 MR 时，将自动分析该分支并把文档写回该 MR 的 source_branch，让文档改动跟着功能代码在同一个 MR 里一起评审并合入。\n"
+                            "• 若当前分支暂无活跃 MR，将按单分支模式扫描快照并写回（保护分支自动切出文档分支提交 MR）。\n\n"
+                            "确定开始生成吗？"
+                        ),
+                    },
+                },
             },
             {
                 "tag": "button",

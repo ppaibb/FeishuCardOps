@@ -195,6 +195,27 @@ class GitLabClient:
                 return mrs[0] if mrs else None
         return None
 
+    async def get_latest_open_mr(self, project_id: int, source_branch: str) -> Optional[Dict[str, Any]]:
+        """获取指定源分支当前活跃（opened）的最新 Merge Request"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/merge_requests"
+        headers = {"PRIVATE-TOKEN": self.token}
+        params = {
+            "source_branch": source_branch,
+            "state": "opened",
+            "order_by": "updated_at",
+            "sort": "desc",
+            "per_page": 1,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                if resp.status_code == 200:
+                    mrs = resp.json()
+                    return mrs[0] if mrs else None
+        except Exception as e:
+            logger.warning("get_latest_open_mr failed project_id=%s branch=%s err=%s", project_id, source_branch, e)
+        return None
+
     async def get_latest_merged_mr(self, project_id: int, target_branch: str) -> Optional[Dict[str, Any]]:
         """获取最近合并到指定目标分支的 Merge Request"""
         url = f"{self.base_url}/api/v4/projects/{project_id}/merge_requests"

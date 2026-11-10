@@ -188,6 +188,61 @@ def _compute_commit_actions(
     return actions
 
 
+async def _resolve_wiki_mr_context(
+    gitlab_client: GitLabClient,
+    project_id: int,
+    branch: str,
+    proj_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """检测当前分支是否存在活跃 MR（源分支模式）或近期已合入 MR 信息"""
+    active_mr: Optional[Dict[str, Any]] = None
+    recent_merged_mr: Optional[Dict[str, Any]] = None
+
+    try:
+        mr = await gitlab_client.get_latest_open_mr(project_id, branch)
+        if isinstance(mr, dict) and mr.get("iid"):
+            mr_iid = int(mr["iid"])
+            changed_files_count: Optional[int] = None
+            try:
+                mr_detail = await gitlab_client.get_mr_changes(project_id, mr_iid)
+                if isinstance(mr_detail, dict) and isinstance(mr_detail.get("changes"), list):
+                    changed_files_count = len(mr_detail["changes"])
+            except Exception as e:
+                logger.warning("fetch active mr changes failed project_id=%s mr_iid=%s err=%s", project_id, mr_iid, e)
+
+            author_obj = mr.get("author")
+            active_mr = {
+                "iid": mr_iid,
+                "title": str(mr.get("title") or ""),
+                "web_url": str(mr.get("web_url") or ""),
+                "source_branch": str(mr.get("source_branch") or branch),
+                "target_branch": str(mr.get("target_branch") or ""),
+                "state": str(mr.get("state") or "opened"),
+                "author_name": str(author_obj.get("name") or "") if isinstance(author_obj, dict) else "",
+                "changed_files_count": changed_files_count,
+            }
+    except Exception as e:
+        logger.warning("resolve active mr failed project_id=%s branch=%s err=%s", project_id, branch, e)
+
+    if not active_mr:
+        default_branch = str((proj_info or {}).get("default_branch") or "")
+        if default_branch and branch == default_branch:
+            try:
+                merged = await gitlab_client.get_latest_merged_mr(project_id, branch)
+                if isinstance(merged, dict) and merged.get("iid"):
+                    recent_merged_mr = {
+                        "iid": int(merged["iid"]),
+                        "title": str(merged.get("title") or ""),
+                        "web_url": str(merged.get("web_url") or ""),
+                        "source_branch": str(merged.get("source_branch") or ""),
+                        "target_branch": str(merged.get("target_branch") or branch),
+                    }
+            except Exception as e:
+                logger.warning("resolve recent merged mr failed project_id=%s branch=%s err=%s", project_id, branch, e)
+
+    return {"active_mr": active_mr, "recent_merged_mr": recent_merged_mr}
+
+
 async def _commit_wiki_with_fallback(
     gitlab_client: GitLabClient,
     project_id: int,
@@ -196,6 +251,7 @@ async def _commit_wiki_with_fallback(
     wiki_dir: str,
     bundle: Dict[str, Any],
     progress_cb=None,
+    active_mr_iid: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     优先直推目标分支（带 [skip ci]）；遇到保护分支 HTTP 400/403 时自动切出 docs/repowiki-<branch> 并创建或复用 MR。
@@ -204,7 +260,8 @@ async def _commit_wiki_with_fallback(
     project_web_url = (proj_info or {}).get("web_url") or ""
     bundle_files: Dict[str, str] = bundle["files"]
     short_sha = commit_sha[:8] if commit_sha else "HEAD"
-    commit_msg = f"docs(repowiki): update RepoWiki for {target_branch} ({short_sha}) [skip ci]"
+    mr_ref_part = f"MR !{active_mr_iid}, " if active_mr_iid else ""
+    commit_msg = f"docs(repowiki): update RepoWiki for {target_branch} ({mr_ref_part}{short_sha}) [skip ci]"
 
     # 1. 尝试直推目标分支
     existing_tree = await gitlab_client.list_repository_tree(project_id, ref=target_branch, path=wiki_dir, recursive=True)
@@ -344,6 +401,8 @@ async def background_run_wiki(
     sub_message_ids: List[str] = []
     commit_sha = ""
     commit_url = ""
+    active_mr: Optional[Dict[str, Any]] = None
+    recent_merged_mr: Optional[Dict[str, Any]] = None
     current_stage = {"text": "🔎 正在校验提交基线与增量缓存..."}
     canceling_flag = {"active": False}
     current_task = asyncio.current_task()
@@ -354,6 +413,18 @@ async def background_run_wiki(
 
     def _elapsed() -> float:
         return max(0.0, asyncio.get_event_loop().time() - start_time)
+
+    def _base_meta(**extra: Any) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {
+            "subpath": subpath,
+            "wiki_dir": wiki_dir,
+            "lock_scope": lock_scope,
+            "elapsed_seconds": _elapsed(),
+            "active_mr": active_mr,
+            "recent_merged_mr": recent_merged_mr,
+        }
+        meta.update(extra)
+        return meta
 
     async def _send_or_update_cards(card: Dict[str, Any]) -> None:
         if not sub_message_ids:
@@ -395,12 +466,7 @@ async def background_run_wiki(
                 commit_sha=commit_sha,
                 commit_url=commit_url,
                 lock_scope=lock_scope,
-                result_info={
-                    "subpath": subpath,
-                    "wiki_dir": wiki_dir,
-                    "lock_scope": lock_scope,
-                    "elapsed_seconds": _elapsed(),
-                },
+                result_info=_base_meta(),
             )
         )
 
@@ -422,12 +488,7 @@ async def background_run_wiki(
                     commit_sha=commit_sha,
                     commit_url=commit_url,
                     lock_scope=lock_scope,
-                    result_info={
-                        "subpath": subpath,
-                        "wiki_dir": wiki_dir,
-                        "lock_scope": lock_scope,
-                        "elapsed_seconds": _elapsed(),
-                    },
+                    result_info=_base_meta(),
                 )
             )
 
@@ -480,6 +541,11 @@ async def background_run_wiki(
 
         commit_url = _build_commit_url(project_web_url, commit_sha)
 
+        # 1.5 检测当前分支是否绑定活跃 Merge Request（Pre-Merge 协同写入 MR 源分支）
+        mr_ctx = await _resolve_wiki_mr_context(gitlab_client, project_id, branch, proj_info)
+        active_mr = mr_ctx["active_mr"]
+        recent_merged_mr = mr_ctx["recent_merged_mr"]
+
         # 2. 检查增量基线缓存（非 force 且 commit_sha / 写入提交与 config_hash 一致且文档仍存在则跳过）
         expected_cfg_hash = stable_digest(
             {
@@ -519,7 +585,12 @@ async def background_run_wiki(
                     names = {item.get("name") for item in tree}
                     if "README.md" in names or "repowiki-metadata.json" in names:
                         final_status = "skipped"
-                        skipped_info = {**cached_base, "elapsed_seconds": _elapsed()}
+                        skipped_info = {
+                            **cached_base,
+                            "elapsed_seconds": _elapsed(),
+                            "active_mr": active_mr or cached_base.get("active_mr"),
+                            "recent_merged_mr": recent_merged_mr or cached_base.get("recent_merged_mr"),
+                        }
                         skipped_card = build_wiki_card(
                             state=state,
                             operator_open_id=operator_open_id,
@@ -533,7 +604,14 @@ async def background_run_wiki(
                         return
 
         # 3. 发送初始运行卡片（同步至当前会话及审计群），启动耗时心跳刷新
-        await _push_running_card("📦 正在拉取 GitLab 仓库快照并提取源码...")
+        if active_mr:
+            init_stage = (
+                f"🔀 已识别活跃 MR !{active_mr['iid']}（`{active_mr['source_branch']}` → `{active_mr['target_branch']}`），"
+                "正在拉取快照并准备将文档写回 MR 源分支协同评审..."
+            )
+        else:
+            init_stage = "🌿 未找到活跃 MR，已按单分支模式拉取 GitLab 仓库快照并提取源码..."
+        await _push_running_card(init_stage)
         ticker_task = asyncio.create_task(_progress_ticker())
 
         archive_bytes = await gitlab_client.download_repository_archive(project_id, commit_sha)
@@ -597,7 +675,12 @@ async def background_run_wiki(
         )
 
         # 6. 写回 GitLab 仓库（直推优先，400/403 保护分支自动切 MR）
-        await _push_running_card("📤 正在将生成的 RepoWiki 写回 GitLab 代码仓库...")
+        if active_mr:
+            await _push_running_card(
+                f"📤 正在将生成的 RepoWiki 写回 MR !{active_mr['iid']} 源分支 `{active_mr['source_branch']}`（随 MR 一并评审合入）..."
+            )
+        else:
+            await _push_running_card("📤 正在将生成的 RepoWiki 写回 GitLab 代码仓库...")
         if await get_wiki_cancel_info(lock_scope):
             raise asyncio.CancelledError()
 
@@ -609,26 +692,25 @@ async def background_run_wiki(
             wiki_dir=wiki_dir,
             bundle=bundle,
             progress_cb=_push_running_card,
+            active_mr_iid=active_mr["iid"] if active_mr else None,
         )
 
         await _stop_ticker()
         elapsed = _elapsed()
-        result_info = {
-            "wiki_dir": wiki_dir,
-            "subpath": subpath,
-            "commit_sha": commit_sha,
-            "config_hash": bundle["config_hash"],
-            "fingerprint": source["fingerprint"],
-            "eligible_files": len(source["files"]),
-            "omitted_files": len(source["omitted"]),
-            "pages_count": bundle["pages_count"],
-            "cards_count": bundle["cards_count"],
-            "topics": bundle["topics"],
-            "model_calls": llm.calls,
-            "reported_tokens": llm.tokens,
-            "elapsed_seconds": elapsed,
+        result_info = _base_meta(
+            commit_sha=commit_sha,
+            config_hash=bundle["config_hash"],
+            fingerprint=source["fingerprint"],
+            eligible_files=len(source["files"]),
+            omitted_files=len(source["omitted"]),
+            pages_count=bundle["pages_count"],
+            cards_count=bundle["cards_count"],
+            topics=bundle["topics"],
+            model_calls=llm.calls,
+            reported_tokens=llm.tokens,
+            elapsed_seconds=elapsed,
             **write_res,
-        }
+        )
 
         if redis:
             try:
@@ -663,12 +745,7 @@ async def background_run_wiki(
                     stage_text=current_stage["text"],
                     commit_sha=commit_sha,
                     commit_url=commit_url,
-                    result_info={
-                        "subpath": subpath,
-                        "wiki_dir": wiki_dir,
-                        "elapsed_seconds": _elapsed(),
-                        **cancel_info,
-                    },
+                    result_info=_base_meta(**cancel_info),
                 )
             )
         except Exception as e:
@@ -688,7 +765,7 @@ async def background_run_wiki(
                 w_status="failed",
                 commit_sha=commit_sha,
                 commit_url=commit_url,
-                result_info={"subpath": subpath, "wiki_dir": wiki_dir, "elapsed_seconds": _elapsed()},
+                result_info=_base_meta(),
                 error_info=f"GitLab API 请求失败 (HTTP {exc.response.status_code})：{detail}",
             )
         )
@@ -702,7 +779,7 @@ async def background_run_wiki(
                 w_status="failed",
                 commit_sha=commit_sha,
                 commit_url=commit_url,
-                result_info={"subpath": subpath, "wiki_dir": wiki_dir, "elapsed_seconds": _elapsed()},
+                result_info=_base_meta(),
                 error_info=str(exc),
             )
         )

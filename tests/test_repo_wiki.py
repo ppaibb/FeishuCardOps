@@ -289,6 +289,11 @@ class TestWikiSkipCacheAndFeishuUI(unittest.IsolatedAsyncioTestCase):
         wiki_btn = [b for b in actions if b.get("value", {}).get("action") == "repo_wiki"]
         self.assertEqual(len(wiki_btn), 1)
         self.assertIn("Wiki", wiki_btn[0]["text"]["content"])
+        self.assertIn("confirm", wiki_btn[0])
+        confirm_text = wiki_btn[0]["confirm"]["text"]["content"]
+        self.assertIn("活跃 MR", confirm_text)
+        self.assertIn("source_branch", confirm_text)
+        self.assertIn("一起评审并合入", confirm_text)
 
         mr_card = build_wiki_card(
             state=state,
@@ -493,6 +498,7 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
         data = json.loads(resp.body.decode("utf-8"))
         self.assertEqual(data["toast"]["type"], "info")
         self.assertIn("RepoWiki", data["toast"]["content"])
+        self.assertIn("活跃 MR", data["toast"]["content"])
         mock_try_lock.assert_awaited_once_with("18:main:all")
 
     @patch("services.notification.check_and_send_release_note", new_callable=AsyncMock)
@@ -922,6 +928,127 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
         msg_id, updated_card = mock_feishu.update_card.call_args[0]
         self.assertEqual(msg_id, "om_wiki_1")
         self.assertEqual(updated_card["header"]["template"], "orange")
+
+    @patch("services.repo_wiki.unlock_wiki", new_callable=AsyncMock)
+    @patch("core.state.get_redis")
+    @patch("services.repo_wiki.get_redis")
+    @patch("services.repo_wiki.AnthropicWikiModel")
+    async def test_background_run_wiki_active_mr_commits_to_source_branch_and_links_mr(
+        self, mock_model_cls, mock_get_redis, mock_state_redis, mock_unlock
+    ):
+        mock_redis = AsyncMock()
+        mock_redis.get.return_value = None
+        mock_get_redis.return_value = mock_redis
+        mock_state_redis.return_value = mock_redis
+
+        async def fake_llm(purpose, instructions, ctx):
+            if purpose == "wiki.overview":
+                return "# 仓库总览\n\n核心代码见 `src/auth.py:1`。" + ("补充总览描述信息。\n" * 8)
+            if purpose == "wiki.catalogue":
+                return json.dumps(
+                    {
+                        "sections": [
+                            {
+                                "id": "auth",
+                                "title": "认证模块",
+                                "goal": "解析登录认证逻辑",
+                                "files": ["src/auth.py"],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if purpose == "wiki.page":
+                return "# 认证模块\n\n入口定义在 `src/auth.py:1`。" + ("补充认证模块说明信息。\n" * 10)
+            if purpose == "cards.module":
+                return json.dumps(
+                    {
+                        "cards": [
+                            {
+                                "type": "overview",
+                                "title": "模块概览",
+                                "content": "# 模块概览\n\n入口位于 `src/auth.py:1`，主要承担认证校验与会话分发职责，依赖关系清晰简洁。",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            raise AssertionError(purpose)
+
+        fake_model_instance = MagicMock()
+        fake_model_instance.calls = 4
+        fake_model_instance.tokens = 888
+        fake_model_instance.call = AsyncMock(side_effect=fake_llm)
+        mock_model_cls.return_value = fake_model_instance
+
+        feishu = AsyncMock()
+        feishu.send_card.return_value = {"data": {"message_id": "om_mr_wiki"}}
+        feishu.update_card.return_value = {"code": 0}
+
+        gitlab = AsyncMock()
+        gitlab.get_project.return_value = {"web_url": "https://gitlab.example.com/group/demo", "default_branch": "main"}
+        gitlab.get_branch.return_value = {"commit": {"id": "sha_feat_001"}}
+        gitlab.get_latest_open_mr.return_value = {
+            "iid": 45,
+            "title": "feat: 优化登录认证",
+            "state": "opened",
+            "source_branch": "feat/auth",
+            "target_branch": "main",
+            "web_url": "https://gitlab.example.com/group/demo/-/merge_requests/45",
+            "author": {"name": "张三"},
+        }
+        gitlab.get_mr_changes.return_value = {"changes": [{"new_path": "src/auth.py"}, {"new_path": "README.md"}]}
+        gitlab.download_repository_archive.return_value = _make_tar_gz(
+            {"README.md": "# Demo\n", "src/auth.py": "def login():\n    return True\n"}
+        )
+        gitlab.list_repository_tree.return_value = []
+        gitlab.create_commit.return_value = {
+            "id": "sha_wiki_mr_commit",
+            "web_url": "https://gitlab.example.com/group/demo/-/commit/sha_wiki_mr_commit",
+        }
+
+        cfg = {
+            "ai": {"api_key": "sk-test", "base_url": "https://api.example.com", "model": "MiniMax-M2.7"},
+            "feishu": {},
+            "projects": [],
+        }
+        state = {"project": "Demo", "repo": "后端", "repo_id": 99, "branch": "feat/auth", "env": "test"}
+
+        await background_run_wiki(
+            feishu_client=feishu,
+            gitlab_client=gitlab,
+            cfg=cfg,
+            state=state,
+            operator_open_id="ou_dev",
+            open_chat_id="oc_dev",
+            lock_scope="99:feat/auth:all",
+            force=False,
+        )
+
+        # 验证直接提交至 MR 的 source_branch，且提交信息标注 MR !45 与 [skip ci]
+        gitlab.create_commit.assert_awaited_once()
+        commit_kwargs = gitlab.create_commit.call_args.kwargs
+        self.assertEqual(commit_kwargs["branch"], "feat/auth")
+        self.assertIn("MR !45", commit_kwargs["commit_message"])
+        self.assertIn("[skip ci]", commit_kwargs["commit_message"])
+
+        # 验证初始运行卡片展示 MR 联动信息与变更文件数
+        first_card = feishu.send_card.call_args[0][1]
+        first_md = "\n".join(e.get("content", "") for e in first_card["elements"] if e.get("tag") == "markdown")
+        self.assertIn("MR !45", first_md)
+        self.assertIn("变更 `2` 个文件", first_md)
+
+        # 验证最终结果卡片标题、正文说明与直达活跃 MR 按钮
+        last_card = feishu.update_card.call_args_list[-1][0][1]
+        self.assertIn("写入活跃 MR", last_card["header"]["title"]["content"])
+        last_md = "\n".join(e.get("content", "") for e in last_card["elements"] if e.get("tag") == "markdown")
+        self.assertIn("feat/auth", last_md)
+        self.assertIn("一起评审并合入", last_md)
+        action_btns = [a for e in last_card["elements"] if e.get("tag") == "action" for a in e.get("actions", [])]
+        urls = [b.get("url") for b in action_btns]
+        self.assertIn("https://gitlab.example.com/group/demo/-/merge_requests/45", urls)
+        self.assertTrue(any("查看 MR !45" in (b.get("text") or {}).get("content", "") for b in action_btns))
+        mock_unlock.assert_awaited_once_with("99:feat/auth:all")
 
 
 if __name__ == "__main__":
