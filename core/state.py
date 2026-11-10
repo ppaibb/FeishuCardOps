@@ -93,3 +93,22 @@ async def unlock_sonar(lock_scope: str) -> None:
     r = get_redis()
     logger.info("unlocking sonar scope=%s", lock_scope)
     await r.delete(f"sonar_lock:{lock_scope}")
+
+
+async def try_lock_wiki(lock_scope: str, ttl: int = 1800) -> bool:
+    """尝试获取独立的 RepoWiki 生成并发锁（与发版锁、Sonar 锁完全隔离）"""
+    if not lock_scope:
+        return False
+    r = get_redis()
+    success = await r.set(f"wiki_lock:{lock_scope}", "1", nx=True, ex=ttl)
+    if success:
+        logger.info("try_lock_wiki succeeded scope=%s", lock_scope)
+    return bool(success)
+
+
+async def unlock_wiki(lock_scope: str) -> None:
+    if not lock_scope:
+        return
+    r = get_redis()
+    logger.info("unlocking wiki scope=%s", lock_scope)
+    await r.delete(f"wiki_lock:{lock_scope}")

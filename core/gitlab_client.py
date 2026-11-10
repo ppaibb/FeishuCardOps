@@ -1,6 +1,7 @@
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -247,6 +248,160 @@ class GitLabClient:
             if resp.status_code in [200, 201]:
                 return resp.json()
             return {}
+
+    async def download_repository_archive(
+        self, project_id: int, ref: str, max_archive_bytes: int = 80 * 1024 * 1024
+    ) -> bytes:
+        """下载指定引用/分支的 tar.gz 源码快照归档，带体积上限保护"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/archive.tar.gz"
+        headers = {"PRIVATE-TOKEN": self.token}
+        params = {"sha": ref} if ref else {}
+        async with httpx.AsyncClient(timeout=120, follow_redirects=False) as client:
+            async with client.stream("GET", url, headers=headers, params=params) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    resp.raise_for_status()
+                chunks: List[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_archive_bytes:
+                        raise ValueError(f"仓库快照体积超过上限 ({max_archive_bytes // (1024 * 1024)} MB)，请缩小范围后重试")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+    async def get_branch(self, project_id: int, branch: str) -> Optional[Dict[str, Any]]:
+        """查询单个分支信息（不存在返回 None）"""
+        encoded = quote(branch, safe="")
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/branches/{encoded}"
+        headers = {"PRIVATE-TOKEN": self.token}
+        async with httpx.AsyncClient(timeout=15, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return None
+
+    async def create_branch(self, project_id: int, branch: str, ref: str) -> Dict[str, Any]:
+        """从指定 ref 创建分支"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/branches"
+        headers = {"PRIVATE-TOKEN": self.token}
+        async with httpx.AsyncClient(timeout=20, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+            resp = await client.post(url, headers=headers, json={"branch": branch, "ref": ref})
+            resp.raise_for_status()
+            return resp.json()
+
+    async def delete_branch(self, project_id: int, branch: str) -> bool:
+        """删除分支"""
+        encoded = quote(branch, safe="")
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/branches/{encoded}"
+        headers = {"PRIVATE-TOKEN": self.token}
+        async with httpx.AsyncClient(timeout=20, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+            resp = await client.delete(url, headers=headers)
+            return resp.status_code in {200, 204}
+
+    async def list_repository_tree(
+        self, project_id: int, ref: str, path: str = "", recursive: bool = True
+    ) -> List[Dict[str, Any]]:
+        """分页列出指定路径下仓库目录树（目录不存在返回空列表）"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/tree"
+        headers = {"PRIVATE-TOKEN": self.token}
+        items: List[Dict[str, Any]] = []
+        page = 1
+        async with httpx.AsyncClient(timeout=30, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+            for _ in range(20):
+                params: Dict[str, Any] = {
+                    "ref": ref,
+                    "recursive": "true" if recursive else "false",
+                    "per_page": 100,
+                    "page": page,
+                }
+                if path:
+                    params["path"] = path.strip("/")
+                resp = await client.get(url, headers=headers, params=params)
+                if resp.status_code == 404:
+                    return []
+                resp.raise_for_status()
+                batch = resp.json()
+                if not isinstance(batch, list) or not batch:
+                    break
+                items.extend(batch)
+                next_page = resp.headers.get("x-next-page", "").strip()
+                if not next_page:
+                    break
+                try:
+                    page = int(next_page)
+                except ValueError:
+                    break
+        return items
+
+    async def create_commit(
+        self,
+        project_id: int,
+        branch: str,
+        commit_message: str,
+        actions: List[Dict[str, Any]],
+        start_branch: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """通过 GitLab Multi-file Commits API 原子提交多文件变更"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/repository/commits"
+        headers = {"PRIVATE-TOKEN": self.token}
+        payload: Dict[str, Any] = {
+            "branch": branch,
+            "commit_message": commit_message,
+            "actions": actions,
+        }
+        if start_branch:
+            payload["start_branch"] = start_branch
+        async with httpx.AsyncClient(timeout=60, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def find_open_merge_request(
+        self, project_id: int, source_branch: str, target_branch: str
+    ) -> Optional[Dict[str, Any]]:
+        """查找已存在的 Open 状态 Merge Request"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/merge_requests"
+        headers = {"PRIVATE-TOKEN": self.token}
+        params = {
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "state": "opened",
+            "per_page": 1,
+        }
+        async with httpx.AsyncClient(timeout=15, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code == 200:
+                mrs = resp.json()
+                return mrs[0] if mrs else None
+        return None
+
+    async def create_merge_request(
+        self,
+        project_id: int,
+        source_branch: str,
+        target_branch: str,
+        title: str,
+        description: str,
+        remove_source_branch: bool = True,
+    ) -> Dict[str, Any]:
+        """创建 Merge Request"""
+        url = f"{self.base_url}/api/v4/projects/{project_id}/merge_requests"
+        headers = {"PRIVATE-TOKEN": self.token}
+        payload = {
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "title": title,
+            "description": description,
+            "remove_source_branch": remove_source_branch,
+        }
+        async with httpx.AsyncClient(timeout=30, event_hooks={'request': [_log_req], 'response': [_log_resp]}) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()
 
 
 DEFAULT_GITLAB_INSTANCE = "default"

@@ -27,17 +27,19 @@ from core.state import (
     is_repo_locked,
     try_lock_repo,
     try_lock_sonar,
+    try_lock_wiki,
     lock_repo,
     save_card_state,
 )
 from services.approval import create_approval, get_approval, resolve_approval
 from services.history import get_history
 from services.pipeline import background_run_pipeline, delayed_update_card, next_card_version
+from services.repo_wiki import background_run_wiki, build_wiki_lock_scope
 from services.sonar_scan import background_run_sonar, build_sonar_lock_scope
 from core.metrics import (
     CARD_INTERACTION, APPROVAL_RESOLVED, PIPELINE_TRIGGERED,
     AI_REVIEW_TRIGGERED, PROJECT_DELETED, APPROVAL_TRIGGERED, ACTIVE_LOCKS,
-    SONAR_SCAN_TRIGGERED,
+    SONAR_SCAN_TRIGGERED, WIKI_GEN_TRIGGERED,
 )
 
 logger = logging.getLogger("feishu_gitlab_card_http")
@@ -115,6 +117,8 @@ async def feishu_card(request: Request):
             action_name = "history"
         elif "Sonar" in button_text:
             action_name = "sonar_scan"
+        elif "Wiki" in button_text or "wiki" in button_text:
+            action_name = "repo_wiki"
         elif "批准" in button_text:
             action_name = "approve"
         elif "驳回" in button_text:
@@ -305,7 +309,7 @@ async def feishu_card(request: Request):
             selected_env = option
         elif current_field and current_field.startswith("var_") and option:
             selected_vars[current_field[4:]] = option
-    elif action_name in {"run", "refresh", "history", "sonar_scan", "manage_projects", "delete_project", "locked", "cancel_pipeline"} and stored_state:
+    elif action_name in {"run", "refresh", "history", "sonar_scan", "repo_wiki", "manage_projects", "delete_project", "locked", "cancel_pipeline"} and stored_state:
         selected_project = stored_state.get("project")
         selected_repo = stored_state.get("repo")
         selected_branch = stored_state.get("branch")
@@ -342,9 +346,9 @@ async def feishu_card(request: Request):
     logger.info("card action merged state=%s", state)
 
     dedup_key = ""
-    if action_name in {"run", "refresh", "history", "review", "sonar_scan", "manage_projects", "delete_project", "cancel_pipeline"}:
+    if action_name in {"run", "refresh", "history", "review", "sonar_scan", "repo_wiki", "manage_projects", "delete_project", "cancel_pipeline"}:
         dedup_key = f"{open_message_id}:{action_name}:{state.get('project')}:{state.get('repo')}:{state.get('branch')}:{state.get('env')}"
-        dedup_window = 4 if action_name in {"run", "review", "sonar_scan"} else 2
+        dedup_window = 4 if action_name in {"run", "review", "sonar_scan", "repo_wiki"} else 2
         if not await check_action_dedup(dedup_key, dedup_window):
             logger.info("dedup hit key=%s", dedup_key)
             return JSONResponse({})
@@ -466,6 +470,25 @@ async def feishu_card(request: Request):
             background_run_sonar(feishu_client, gitlab, cfg, state, operator_open_id, open_chat_id, lock_scope)
         )
         return JSONResponse({"toast": {"type": "info", "content": "🛡️ 已触发 SonarQube 代码扫描！结果卡片稍后发出..."}})
+
+    # ── RepoWiki 代码知识库生成 ────────────────────────────────────
+    if action_name == "repo_wiki":
+        if "⚠️" in state["branch"]:
+            return JSONResponse({"toast": {"type": "error", "content": "远程分支读取失败，请重新切一次仓库刷出正常分支后再执行！"}})
+
+        ai_cfg = cfg.get("ai") or {}
+        if not ai_cfg.get("api_key") or not ai_cfg.get("model"):
+            return JSONResponse({"toast": {"type": "error", "content": "未配置 AI 模型参数，请先在 config.yaml 添加 ai 段"}})
+
+        lock_scope = build_wiki_lock_scope(state, cfg=cfg)
+        if not await try_lock_wiki(lock_scope):
+            return JSONResponse({"toast": {"type": "warning", "content": "📚 该目标正在生成 RepoWiki，请稍候..."}})
+
+        WIKI_GEN_TRIGGERED.labels(project=state["project"], repo=state["repo"]).inc()
+        asyncio.create_task(
+            background_run_wiki(feishu_client, gitlab, cfg, state, operator_open_id, open_chat_id, lock_scope)
+        )
+        return JSONResponse({"toast": {"type": "info", "content": "📚 已启动 RepoWiki 生成！进度卡片稍后发出..."}})
 
     # ── 执行发版 ─────────────────────────────────────────────────
     if action_name == "run":

@@ -10,7 +10,8 @@ from services.project_manager import get_all_projects, parse_and_add_project, de
 from core.config import load_config
 from core.feishu_client import FeishuClient
 from core.gitlab_client import GitLabClient, build_gitlab_client
-from core.state import check_action_dedup, is_repo_locked
+from core.metrics import WIKI_GEN_TRIGGERED
+from core.state import check_action_dedup, is_repo_locked, try_lock_wiki
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
@@ -72,6 +73,99 @@ async def process_text_message(text: str, chat_id: str, sender_open_id: str = ""
         if "删除项目" in text:
             reply_txt = await delete_project(text)
             await feishu.send_text(chat_id, reply_txt)
+            return
+
+        lowered_text = text.lower()
+        is_wiki_cmd = (
+            any(k in lowered_text for k in ["repowiki", "repo-wiki", "repo_wiki", "生成wiki", "更新wiki", "刷新wiki", "重建wiki", "代码wiki", "仓库wiki"])
+            or ("wiki" in lowered_text and "发版" not in text and "发布" not in text)
+        )
+        if is_wiki_cmd:
+            cfg["projects"] = await get_all_projects()
+            if not cfg["projects"]:
+                await feishu.send_text(chat_id, "❌ 尚未配置任何项目，请先添加项目后再生成 RepoWiki。")
+                return
+
+            gitlab = build_gitlab_client(cfg) or GitLabClient(cfg["gitlab"]["base_url"], cfg["gitlab"]["access_token"])
+            from services.intent_parser import extract_wiki_intent
+            from services.repo_wiki import background_run_wiki, build_wiki_lock_scope
+
+            intent = await extract_wiki_intent(text, cfg["projects"])
+            selected_project = intent.get("project")
+            selected_repo = intent.get("repo")
+            selected_branch = intent.get("branch")
+            force = bool(intent.get("force"))
+
+            if intent.get("unambiguous"):
+                state = await normalize_selection(
+                    cfg, gitlab,
+                    selected_project=selected_project,
+                    selected_repo=selected_repo,
+                    selected_branch=selected_branch,
+                )
+                gitlab = build_gitlab_client(cfg, instance_name=state.get("gitlab_instance")) or gitlab
+
+                branch_not_found = False
+                if selected_branch and selected_branch not in (state.get("branches") or []):
+                    exact_branch = await gitlab.get_branch(state["repo_id"], selected_branch)
+                    if exact_branch:
+                        state["branch"] = selected_branch
+                    else:
+                        branch_not_found = True
+
+                if "⚠️" in state["branch"]:
+                    await feishu.send_text(chat_id, f"❌ 获取 `{state['project']} - {state['repo']}` 分支失败，请检查仓库权限与网络。")
+                    return
+
+                if branch_not_found:
+                    card = build_card(
+                        cfg,
+                        status="就绪",
+                        state=state,
+                        latest_result_text=f"⚠️ 未找到分支 `{selected_branch}`，已回退默认分支 `{state['branch']}`，请确认后点击「📚 生成 Wiki」",
+                        latest_pipeline_text="暂无",
+                        show_details=True,
+                        is_locked=await is_repo_locked(state.get("repo_id", -1)),
+                    )
+                    await feishu.send_card(chat_id, card)
+                    return
+
+                ai_cfg = cfg.get("ai") or {}
+                if not ai_cfg.get("api_key") or not ai_cfg.get("model"):
+                    await feishu.send_text(chat_id, "❌ 未配置 AI 模型参数，请先在 `config.yaml` 添加 `ai` 配置段。")
+                    return
+
+                lock_scope = build_wiki_lock_scope(state, cfg=cfg)
+                if not await try_lock_wiki(lock_scope):
+                    await feishu.send_text(
+                        chat_id,
+                        f"📚 `{state['project']} - {state['repo']} ({state['branch']})` 正在生成 RepoWiki，请稍候...",
+                    )
+                    return
+
+                WIKI_GEN_TRIGGERED.labels(project=state["project"], repo=state["repo"]).inc()
+                asyncio.create_task(
+                    background_run_wiki(feishu, gitlab, cfg, state, sender_open_id, chat_id, lock_scope, force=force)
+                )
+                return
+
+            # 目标不明确（如项目下包含多个仓库且未指定具体仓库）：发送预选控制台卡片引导确认
+            state = await normalize_selection(
+                cfg, gitlab,
+                selected_project=selected_project,
+                selected_repo=selected_repo,
+                selected_branch=selected_branch,
+            )
+            card = build_card(
+                cfg,
+                status="就绪",
+                state=state,
+                latest_result_text="📚 **请确认目标项目、仓库和分支**，核对无误后点击下方「📚 生成 Wiki」",
+                latest_pipeline_text="暂无",
+                show_details=True,
+                is_locked=await is_repo_locked(state.get("repo_id", -1)),
+            )
+            await feishu.send_card(chat_id, card)
             return
 
         if "发版" in text or "发布" in text:

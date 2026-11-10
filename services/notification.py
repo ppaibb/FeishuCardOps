@@ -7,7 +7,7 @@ from core.redis_client import get_redis
 
 logger = logging.getLogger("feishu_gitlab_card_http")
 
-CURRENT_VERSION = "v1.11.0"
+CURRENT_VERSION = "v1.12.0"
 
 RELEASE_NOTE_CARD = {
     "config": {"wide_screen_mode": True},
@@ -16,9 +16,9 @@ RELEASE_NOTE_CARD = {
         {
             "tag": "markdown",
             "content": (
-                "1. 🛡️ **SonarQube 代码扫描 & 报告卡片**：主控制台新增「🛡️ Sonar 扫描」按钮，扫描独立加锁不阻塞正常发版！扫描完成后自动汇总质量门禁明细、全量代码指标评级、Top 重点问题、安全热点及报告直达链接，门禁未通过或含高危问题时自动呈现「收到/排查」闭环确认。\n"
-                "2. 👌 **发版确认闭环（收到/已阅）**：发版结束后卡片底部提供责任人专属确认按钮，杜绝替点并同步沉淀知晓记录。\n"
-                "3. 🎛️ **构建参数与网页直通**：进度卡片全面透出所选微服务与自定义变量，发版成功后自动附带应用直连按钮与环境提示。"
+                "1. 📚 **AI RepoWiki 代码知识库（零 CI 侵入）**：主控制台新增「📚 生成 Wiki」按钮，也支持在群聊直接发送 `项目/仓库 生成wiki`（加「`强制`」跳过基线重建）。机器人直接拉取 GitLab 快照并生成证据级 Markdown 专题与知识卡片写回 `docs/repowiki/`；遇保护分支自动切分支提交 MR，代码无新提交自动跳过省 Token。\n"
+                "2. 🛡️ **SonarQube 代码扫描 & 报告卡片**：主控制台「🛡️ Sonar 扫描」独立加锁不阻塞发版，自动汇总质量门禁、全量指标评级、Top 重点问题及安全热点并支持「收到/排查」闭环确认。\n"
+                "3. 👌 **发版确认闭环 & 网页直通**：发版结束自动附带环境访问直连按钮与责任人确认闭环，透出构建参数与日志 AI 诊断。"
             ),
         }
     ],

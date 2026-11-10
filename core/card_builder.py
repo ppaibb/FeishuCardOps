@@ -546,6 +546,159 @@ def build_sonar_card(
     }
 
 
+def build_wiki_card(
+    state: Dict[str, Any],
+    operator_open_id: str,
+    w_status: str,
+    stage_text: str = "",
+    commit_sha: str = "",
+    commit_url: str = "",
+    result_info: Optional[Dict[str, Any]] = None,
+    error_info: str = "",
+) -> Dict[str, Any]:
+    """构建 RepoWiki 生成进度与结果汇报卡片"""
+    branch = state.get("branch", "-")
+    project_name = state.get("project", "-")
+    repo_name = state.get("repo", "-")
+    subpath = (result_info or {}).get("subpath") or ""
+    subpath_line = f"　|　**子目录**：`{subpath}`" if subpath else ""
+    short_sha = commit_sha[:8] if commit_sha else "-"
+    commit_ref = f"[`{short_sha}`]({commit_url})" if commit_url and short_sha != "-" else f"`{short_sha}`"
+
+    result = result_info or {}
+    write_mode = result.get("write_mode", "")
+
+    if w_status == "running":
+        header_color = "blue"
+        header_title = "⏳ RepoWiki 生成中..."
+        intro = f"<at id=\"{operator_open_id}\"></at> **正在分析源码并生成 RepoWiki 文档...**"
+    elif w_status == "skipped":
+        header_color = "green"
+        header_title = "⚡ RepoWiki 已是最新版本"
+        intro = f"<at id=\"{operator_open_id}\"></at> **当前提交与基线一致，无需重复生成**"
+    elif w_status == "success":
+        if write_mode == "mr":
+            header_color = "green"
+            header_title = "🔀 RepoWiki 已生成并提交 Merge Request"
+            intro = f"<at id=\"{operator_open_id}\"></at> **RepoWiki 生成完成！由于目标分支受保护，已自动切出文档分支并创建 MR** 🎉"
+        else:
+            header_color = "green"
+            header_title = "✅ RepoWiki 生成并写回成功"
+            intro = f"<at id=\"{operator_open_id}\"></at> **RepoWiki 已成功生成并写入代码仓库！** 🎉"
+    else:
+        header_color = "red"
+        header_title = "❌ RepoWiki 生成失败"
+        intro = f"<at id=\"{operator_open_id}\"></at> **RepoWiki 生成过程中发生异常**"
+
+    summary_lines = [
+        intro,
+        "",
+        f"**项目**：{project_name} - {repo_name}",
+        f"**目标分支**：`{branch}`{subpath_line}　|　**基线提交**：{commit_ref}",
+    ]
+
+    if w_status == "running":
+        summary_lines.append(f"**当前进展**：{stage_text or '准备中...'}")
+
+    elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(summary_lines)}]
+    detail_sections: List[str] = []
+
+    if w_status == "skipped":
+        wiki_dir = result.get("wiki_dir", "docs/repowiki")
+        pages_cnt = result.get("pages_count") or "-"
+        cards_cnt = result.get("cards_count") or "-"
+        skipped_lines = [
+            f"• **文档目录**：`{wiki_dir}`（`{pages_cnt}` 篇文档 · `{cards_cnt}` 张知识卡片）",
+            "• **说明**：当前代码指纹未发生变化（`0` 次模型调用）。如需强制重建，可在群聊发送 `强制生成 <项目/仓库> wiki`。",
+        ]
+        detail_sections.append("\n".join(skipped_lines))
+    elif w_status == "success":
+        wiki_dir = result.get("wiki_dir", "docs/repowiki")
+        eligible = result.get("eligible_files", 0)
+        omitted = result.get("omitted_files", 0)
+        pages_cnt = result.get("pages_count", 0)
+        cards_cnt = result.get("cards_count", 0)
+        model_calls = result.get("model_calls", 0)
+        elapsed_sec = result.get("elapsed_seconds")
+        elapsed_text = f" · 耗时 `{elapsed_sec:.1f}s`" if isinstance(elapsed_sec, (int, float)) else ""
+
+        stats_lines = [
+            f"**📊 生成概览**：纳入 `{eligible}` 个源码文件（过滤 `{omitted}` 个）",
+            f"• **产物统计**：文档 `{pages_cnt}` 篇（含总览 README）· 知识卡片 `{cards_cnt}` 张 · AI 调用 `{model_calls}` 次{elapsed_text}",
+            f"• **写入路径**：`{wiki_dir}/README.md`",
+        ]
+
+        write_branch = result.get("write_branch") or branch
+        new_commit_sha = result.get("write_commit_sha") or ""
+        new_commit_short = new_commit_sha[:8] if new_commit_sha else ""
+        if write_mode == "mr":
+            mr_iid = result.get("mr_iid")
+            mr_label = f"!{mr_iid}" if mr_iid else "已创建"
+            reused_tip = "（已更新现有 MR）" if result.get("mr_reused") else "（已自动创建）"
+            stats_lines.append(
+                f"• **写回方式**：🛡️ 保护分支自动降级 → 已推送分支 `{write_branch}` 并提交 MR **{mr_label}** {reused_tip}"
+            )
+        elif write_mode == "no_diff":
+            stats_lines.append(f"• **写回方式**：⚡ 仓库 `{branch}` 已有完全一致文档内容，跳过空提交")
+        else:
+            c_part = f"（提交 `{new_commit_short}`，含 `[skip ci]`）" if new_commit_short else "（含 `[skip ci]`）"
+            stats_lines.append(f"• **写回方式**：✅ 已直接提交至分支 `{write_branch}` {c_part}")
+
+        detail_sections.append("\n".join(stats_lines))
+
+        topics = result.get("topics") or []
+        if topics:
+            topic_lines = ["**📑 已生成专题目录**"]
+            for idx, t in enumerate(topics, 1):
+                topic_lines.append(f"{idx}. **{t.get('title', t.get('id', '专题'))}** — `{t.get('path', '')}`")
+            detail_sections.append("\n".join(topic_lines))
+
+    if w_status == "failed" and error_info:
+        detail_sections.append(f"**🚨 失败原因**\n{_sanitize_feishu_md(error_info, max_len=280)}")
+
+    if detail_sections:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": "\n\n".join(detail_sections)})
+
+    action_buttons: List[Dict[str, Any]] = []
+    if w_status in {"success", "skipped"}:
+        mr_url = str(result.get("mr_url") or "").strip()
+        doc_url = str(result.get("doc_url") or "").strip()
+        write_commit_url = str(result.get("write_commit_url") or "").strip()
+
+        if mr_url:
+            action_buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔀 查看 Merge Request"},
+                "type": "primary",
+                "url": mr_url,
+            })
+        if doc_url:
+            action_buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "📖 查看 GitLab 文档"},
+                "type": "primary" if not action_buttons else "default",
+                "url": doc_url,
+            })
+        if write_commit_url and write_commit_url != doc_url:
+            action_buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔖 查看提交记录"},
+                "type": "default",
+                "url": write_commit_url,
+            })
+
+    if action_buttons:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "action", "actions": action_buttons})
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": header_color, "title": {"tag": "plain_text", "content": header_title}},
+        "elements": elements,
+    }
+
+
 def build_history_card(
     history_records: List[Dict[str, Any]],
     state: Dict[str, Any],
@@ -1098,6 +1251,11 @@ def build_card(
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": "🛡️ Sonar 扫描"},
                 "value": {**action_base_val, "action": "sonar_scan"},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "📚 生成 Wiki"},
+                "value": {**action_base_val, "action": "repo_wiki"},
             },
             {
                 "tag": "button",

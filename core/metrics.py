@@ -81,6 +81,26 @@ SONAR_SCAN_DURATION = Histogram(
     buckets=[15, 30, 60, 120, 180, 300, 600, 900, 1800],
 )
 
+# ───────────────────── RepoWiki 指标 ─────────────────
+WIKI_GEN_TRIGGERED = Counter(
+    "feishu_wiki_gen_triggered_total",
+    "RepoWiki 生成触发总次数",
+    ["project", "repo"],
+)
+
+WIKI_GEN_COMPLETED = Counter(
+    "feishu_wiki_gen_completed_total",
+    "RepoWiki 生成完成总次数（按结果状态）",
+    ["project", "repo", "status"],
+)
+
+WIKI_GEN_DURATION = Histogram(
+    "feishu_wiki_gen_duration_seconds",
+    "RepoWiki 生成耗时（秒）",
+    ["project", "repo"],
+    buckets=[10, 30, 60, 120, 180, 300, 600, 900],
+)
+
 # ───────────────────── 卡片交互指标 ─────────────────
 CARD_INTERACTION = Counter(
     "feishu_card_interaction_total",
