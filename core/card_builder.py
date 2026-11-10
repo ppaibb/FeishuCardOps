@@ -546,6 +546,22 @@ def build_sonar_card(
     }
 
 
+def format_duration(seconds: float) -> str:
+    """将秒数格式化为可读中文时长，如 `8.3秒` / `25秒` / `1分12秒`"""
+    sec = max(0.0, float(seconds))
+    if sec < 10:
+        return f"{sec:.1f}秒"
+    total = int(round(sec))
+    if total < 60:
+        return f"{total}秒"
+    if total < 3600:
+        m, s = divmod(total, 60)
+        return f"{m}分{s:02d}秒"
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}小时{m:02d}分{s:02d}秒"
+
+
 def build_wiki_card(
     state: Dict[str, Any],
     operator_open_id: str,
@@ -555,18 +571,21 @@ def build_wiki_card(
     commit_url: str = "",
     result_info: Optional[Dict[str, Any]] = None,
     error_info: str = "",
+    lock_scope: str = "",
 ) -> Dict[str, Any]:
     """构建 RepoWiki 生成进度与结果汇报卡片"""
     branch = state.get("branch", "-")
     project_name = state.get("project", "-")
     repo_name = state.get("repo", "-")
-    subpath = (result_info or {}).get("subpath") or ""
+    result = result_info or {}
+    subpath = result.get("subpath") or ""
     subpath_line = f"　|　**子目录**：`{subpath}`" if subpath else ""
     short_sha = commit_sha[:8] if commit_sha else "-"
     commit_ref = f"[`{short_sha}`]({commit_url})" if commit_url and short_sha != "-" else f"`{short_sha}`"
 
-    result = result_info or {}
     write_mode = result.get("write_mode", "")
+    elapsed_sec = result.get("elapsed_seconds")
+    elapsed_display = format_duration(elapsed_sec) if isinstance(elapsed_sec, (int, float)) else ""
 
     if w_status == "running":
         header_color = "blue"
@@ -576,6 +595,13 @@ def build_wiki_card(
         header_color = "green"
         header_title = "⚡ RepoWiki 已是最新版本"
         intro = f"<at id=\"{operator_open_id}\"></at> **当前提交与基线一致，无需重复生成**"
+    elif w_status == "canceled":
+        header_color = "orange"
+        header_title = "⏹️ RepoWiki 生成已取消"
+        canceler_id = result.get("canceled_by") or operator_open_id
+        canceler_name = result.get("canceled_by_name")
+        canceler_ref = f"<at id=\"{canceler_id}\"></at>" if canceler_id else (canceler_name or "操作人")
+        intro = f"{canceler_ref} **已手动取消本次 RepoWiki 生成任务**"
     elif w_status == "success":
         if write_mode == "mr":
             header_color = "green"
@@ -598,7 +624,10 @@ def build_wiki_card(
     ]
 
     if w_status == "running":
+        summary_lines.append(f"**⏱️ 使用时间**：`{elapsed_display or '0.0秒'}`")
         summary_lines.append(f"**当前进展**：{stage_text or '准备中...'}")
+    elif elapsed_display:
+        summary_lines.append(f"**⏱️ 使用时间**：`{elapsed_display}`")
 
     elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(summary_lines)}]
     detail_sections: List[str] = []
@@ -612,6 +641,12 @@ def build_wiki_card(
             "• **说明**：当前代码指纹未发生变化（`0` 次模型调用）。如需强制重建，可在群聊发送 `强制生成 <项目/仓库> wiki`。",
         ]
         detail_sections.append("\n".join(skipped_lines))
+    elif w_status == "canceled":
+        cancel_lines = []
+        if stage_text:
+            cancel_lines.append(f"• **中止阶段**：{stage_text}")
+        cancel_lines.append("• **说明**：未提交至 GitLab 的内容已放弃写入；已完成阶段的断点缓存 24 小时内有效，重新触发可自动续跑。")
+        detail_sections.append("\n".join(cancel_lines))
     elif w_status == "success":
         wiki_dir = result.get("wiki_dir", "docs/repowiki")
         eligible = result.get("eligible_files", 0)
@@ -619,12 +654,10 @@ def build_wiki_card(
         pages_cnt = result.get("pages_count", 0)
         cards_cnt = result.get("cards_count", 0)
         model_calls = result.get("model_calls", 0)
-        elapsed_sec = result.get("elapsed_seconds")
-        elapsed_text = f" · 耗时 `{elapsed_sec:.1f}s`" if isinstance(elapsed_sec, (int, float)) else ""
 
         stats_lines = [
             f"**📊 生成概览**：纳入 `{eligible}` 个源码文件（过滤 `{omitted}` 个）",
-            f"• **产物统计**：文档 `{pages_cnt}` 篇（含总览 README）· 知识卡片 `{cards_cnt}` 张 · AI 调用 `{model_calls}` 次{elapsed_text}",
+            f"• **产物统计**：文档 `{pages_cnt}` 篇（含总览 README）· 知识卡片 `{cards_cnt}` 张 · AI 调用 `{model_calls}` 次",
             f"• **写入路径**：`{wiki_dir}/README.md`",
         ]
 
@@ -661,7 +694,28 @@ def build_wiki_card(
         elements.append({"tag": "markdown", "content": "\n\n".join(detail_sections)})
 
     action_buttons: List[Dict[str, Any]] = []
-    if w_status in {"success", "skipped"}:
+    if w_status == "running":
+        resolved_scope = lock_scope or result.get("lock_scope") or f"{state.get('repo_id', 0)}:{branch}:{subpath or 'all'}"
+        action_buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "🛑 取消生成"},
+            "type": "danger",
+            "value": {
+                "action": "cancel_wiki",
+                "lock_scope": resolved_scope,
+                "operator_open_id": operator_open_id,
+                "project": project_name,
+                "repo": repo_name,
+                "repo_id": state.get("repo_id"),
+                "branch": branch,
+                "env": state.get("env", ""),
+            },
+            "confirm": {
+                "title": {"tag": "plain_text", "content": "确认取消 RepoWiki 生成"},
+                "text": {"tag": "plain_text", "content": "确认要中止当前正在运行的 RepoWiki 生成任务吗？未提交至 GitLab 的改动不会写入仓库。"},
+            },
+        })
+    elif w_status in {"success", "skipped"}:
         mr_url = str(result.get("mr_url") or "").strip()
         doc_url = str(result.get("doc_url") or "").strip()
         write_commit_url = str(result.get("write_commit_url") or "").strip()

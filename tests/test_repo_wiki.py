@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
-from core.card_builder import build_card, build_wiki_card
+from core.card_builder import build_card, build_wiki_card, format_duration
 from core.wiki_engine import (
     generate_wiki_bundle,
     git_blob_sha1,
@@ -21,7 +21,9 @@ from services.intent_parser import resolve_wiki_target
 from services.repo_wiki import (
     _commit_wiki_with_fallback,
     _compute_commit_actions,
+    _running_wiki_tasks,
     background_run_wiki,
+    cancel_running_wiki,
 )
 
 
@@ -320,8 +322,11 @@ class TestWikiSkipCacheAndFeishuUI(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://gitlab.example.com/docs/README.md", urls)
 
     @patch("services.repo_wiki.unlock_wiki", new_callable=AsyncMock)
+    @patch("core.state.get_redis")
     @patch("services.repo_wiki.get_redis")
-    async def test_background_run_wiki_skips_when_baseline_matches_write_commit(self, mock_get_redis, mock_unlock):
+    async def test_background_run_wiki_skips_when_baseline_matches_write_commit(
+        self, mock_get_redis, mock_state_redis, mock_unlock
+    ):
         mock_redis = AsyncMock()
         cached_baseline = {
             "commit_sha": "source_sha_1",
@@ -348,6 +353,7 @@ class TestWikiSkipCacheAndFeishuUI(unittest.IsolatedAsyncioTestCase):
         )
         mock_redis.get.return_value = json.dumps(cached_baseline)
         mock_get_redis.return_value = mock_redis
+        mock_state_redis.return_value = mock_redis
 
         feishu = AsyncMock()
         gitlab = AsyncMock()
@@ -573,14 +579,16 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
         mock_feishu.send_card.assert_awaited_once()
 
     @patch("services.repo_wiki.unlock_wiki", new_callable=AsyncMock)
+    @patch("core.state.get_redis")
     @patch("services.repo_wiki.get_redis")
     @patch("services.repo_wiki.AnthropicWikiModel")
     async def test_background_run_wiki_full_flow_and_unlock_on_success(
-        self, mock_model_cls, mock_get_redis, mock_unlock
+        self, mock_model_cls, mock_get_redis, mock_state_redis, mock_unlock
     ):
         mock_redis = AsyncMock()
         mock_redis.get.return_value = None
         mock_get_redis.return_value = mock_redis
+        mock_state_redis.return_value = mock_redis
 
         async def fake_llm(purpose, instructions, ctx):
             if purpose == "wiki.overview":
@@ -671,6 +679,249 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
         baseline_set_calls = [c for c in mock_redis.set.call_args_list if "wiki_baseline" in c[0][0]]
         self.assertEqual(len(baseline_set_calls), 1)
         mock_unlock.assert_awaited_once_with("99:develop:all")
+
+    def test_format_duration_and_wiki_card_states(self):
+        self.assertEqual(format_duration(0.34), "0.3秒")
+        self.assertEqual(format_duration(15.2), "15秒")
+        self.assertEqual(format_duration(65.0), "1分05秒")
+        self.assertEqual(format_duration(3665.0), "1小时01分05秒")
+
+        state = {"project": "Kitefly", "repo": "前端", "repo_id": 22, "branch": "main", "env": "test"}
+
+        # 1. 运行中卡片：包含使用时间 + 带确认弹窗的「🛑 取消生成」按钮
+        running_card = build_wiki_card(
+            state=state,
+            operator_open_id="ou_dev",
+            w_status="running",
+            stage_text="正在撰写专题...",
+            commit_sha="1234567890",
+            lock_scope="22:main:all",
+            result_info={"elapsed_seconds": 8.3},
+        )
+        running_md = "\n".join(e.get("content", "") for e in running_card["elements"] if e.get("tag") == "markdown")
+        self.assertIn("使用时间", running_md)
+        self.assertIn("8.3秒", running_md)
+        running_actions = [a for e in running_card["elements"] if e.get("tag") == "action" for a in e.get("actions", [])]
+        cancel_btns = [a for a in running_actions if a.get("value", {}).get("action") == "cancel_wiki"]
+        self.assertEqual(len(cancel_btns), 1)
+        self.assertEqual(cancel_btns[0]["type"], "danger")
+        self.assertEqual(cancel_btns[0]["value"]["lock_scope"], "22:main:all")
+        self.assertIn("confirm", cancel_btns[0])
+
+        # 2. 已取消卡片：橙色卡片，展示取消人、使用时间且无操作按钮
+        canceled_card = build_wiki_card(
+            state=state,
+            operator_open_id="ou_dev",
+            w_status="canceled",
+            stage_text="正在生成专题页...",
+            commit_sha="1234567890",
+            result_info={"elapsed_seconds": 65.0, "canceled_by": "ou_mgr", "canceled_by_name": "李四"},
+        )
+        self.assertEqual(canceled_card["header"]["template"], "orange")
+        self.assertIn("已取消", canceled_card["header"]["title"]["content"])
+        canceled_md = "\n".join(e.get("content", "") for e in canceled_card["elements"] if e.get("tag") == "markdown")
+        self.assertIn("1分05秒", canceled_md)
+        self.assertIn('<at id="ou_mgr"></at>', canceled_md)
+        self.assertIn("正在生成专题页", canceled_md)
+        self.assertEqual([e for e in canceled_card["elements"] if e.get("tag") == "action"], [])
+
+        # 3. 失败与成功卡片均展示使用时间
+        failed_card = build_wiki_card(
+            state=state,
+            operator_open_id="ou_dev",
+            w_status="failed",
+            result_info={"elapsed_seconds": 12.0},
+            error_info="API timeout",
+        )
+        failed_md = "\n".join(e.get("content", "") for e in failed_card["elements"] if e.get("tag") == "markdown")
+        self.assertIn("使用时间", failed_md)
+        self.assertIn("12秒", failed_md)
+
+    @patch("services.repo_wiki.unlock_wiki", new_callable=AsyncMock)
+    @patch("core.state.get_redis")
+    @patch("services.repo_wiki.get_redis")
+    @patch("services.repo_wiki.AnthropicWikiModel")
+    async def test_cancel_running_wiki_aborts_live_task_without_committing(
+        self, mock_model_cls, mock_get_redis, mock_state_redis, mock_unlock
+    ):
+        kv_store = {}
+
+        async def redis_get(key):
+            return kv_store.get(key)
+
+        async def redis_set(key, val, ex=None):
+            kv_store[key] = val
+            return True
+
+        async def redis_setex(key, ttl, val):
+            kv_store[key] = val
+            return True
+
+        async def redis_delete(*keys):
+            for k in keys:
+                kv_store.pop(k, None)
+            return 1
+
+        mock_redis = AsyncMock()
+        mock_redis.get.side_effect = redis_get
+        mock_redis.set.side_effect = redis_set
+        mock_redis.setex.side_effect = redis_setex
+        mock_redis.delete.side_effect = redis_delete
+        mock_get_redis.return_value = mock_redis
+        mock_state_redis.return_value = mock_redis
+
+        entered_model = asyncio.Event()
+
+        async def blocking_llm(purpose, instructions, ctx):
+            entered_model.set()
+            await asyncio.sleep(30)
+            return "never returned"
+
+        fake_model_instance = MagicMock()
+        fake_model_instance.calls = 1
+        fake_model_instance.tokens = 0
+        fake_model_instance.call = AsyncMock(side_effect=blocking_llm)
+        mock_model_cls.return_value = fake_model_instance
+
+        feishu = AsyncMock()
+        feishu.send_card.return_value = {"data": {"message_id": "om_wiki_run"}}
+        feishu.update_card.return_value = {"code": 0}
+
+        gitlab = AsyncMock()
+        gitlab.get_project.return_value = {"web_url": "https://gitlab.example.com/group/demo"}
+        gitlab.get_branch.return_value = {"commit": {"id": "sha_head_002"}}
+        gitlab.download_repository_archive.return_value = _make_tar_gz(
+            {"README.md": "# Demo\n", "src/main.py": "print('hi')\n"}
+        )
+
+        cfg = {
+            "ai": {"api_key": "sk-test", "base_url": "https://api.example.com", "model": "MiniMax-M2.7"},
+            "feishu": {},
+            "projects": [],
+        }
+        state = {"project": "Demo", "repo": "后端", "repo_id": 88, "branch": "main", "env": "test"}
+        lock_scope = "88:main:all"
+        kv_store[f"wiki_lock:{lock_scope}"] = "1"
+
+        task = asyncio.create_task(
+            background_run_wiki(
+                feishu_client=feishu,
+                gitlab_client=gitlab,
+                cfg=cfg,
+                state=state,
+                operator_open_id="ou_starter",
+                open_chat_id="oc_dev",
+                lock_scope=lock_scope,
+                force=False,
+            )
+        )
+        await asyncio.wait_for(entered_model.wait(), timeout=5)
+
+        cancel_res = await cancel_running_wiki(
+            lock_scope, canceler_open_id="ou_canceler", canceler_name="王五"
+        )
+        self.assertTrue(cancel_res["ok"])
+        self.assertFalse(cancel_res["stale_unlocked"])
+        self.assertIn("取消", cancel_res["msg"])
+
+        await asyncio.wait_for(task, timeout=5)
+
+        gitlab.create_commit.assert_not_called()
+        mock_unlock.assert_awaited_once_with(lock_scope)
+        self.assertNotIn(lock_scope, _running_wiki_tasks)
+        self.assertNotIn(f"wiki_cancel:{lock_scope}", kv_store)
+
+        last_card = feishu.update_card.call_args_list[-1][0][1]
+        self.assertEqual(last_card["header"]["template"], "orange")
+        self.assertIn("已取消", last_card["header"]["title"]["content"])
+        card_md = "\n".join(e.get("content", "") for e in last_card["elements"] if e.get("tag") == "markdown")
+        self.assertIn("使用时间", card_md)
+        self.assertIn('<at id="ou_canceler"></at>', card_md)
+
+    @patch("services.repo_wiki.clear_wiki_cancel", new_callable=AsyncMock)
+    @patch("services.repo_wiki.unlock_wiki", new_callable=AsyncMock)
+    @patch("services.repo_wiki.request_wiki_cancel", new_callable=AsyncMock)
+    @patch("services.repo_wiki.get_wiki_cancel_info", new_callable=AsyncMock)
+    @patch("services.repo_wiki.is_wiki_locked", new_callable=AsyncMock)
+    async def test_cancel_running_wiki_cleans_up_stale_lock(
+        self, mock_is_locked, mock_get_cancel, mock_req_cancel, mock_unlock, mock_clear_cancel
+    ):
+        _running_wiki_tasks.pop("77:main:all", None)
+        mock_is_locked.return_value = True
+        mock_get_cancel.return_value = None
+
+        res = await cancel_running_wiki("77:main:all", canceler_open_id="ou_1", canceler_name="测试")
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["stale_unlocked"])
+        mock_unlock.assert_awaited_once_with("77:main:all")
+        mock_clear_cancel.assert_awaited_once_with("77:main:all")
+
+    @patch("services.notification.check_and_send_release_note", new_callable=AsyncMock)
+    @patch("routes.card.FeishuClient")
+    @patch("routes.card.cancel_running_wiki", new_callable=AsyncMock)
+    @patch("routes.card.check_action_dedup", new_callable=AsyncMock)
+    @patch("routes.card.get_card_state", new_callable=AsyncMock)
+    @patch("routes.card.get_all_projects", new_callable=AsyncMock)
+    @patch("routes.card.load_config")
+    async def test_route_cancel_wiki_handles_active_and_stale_lock(
+        self,
+        mock_load_cfg,
+        mock_get_projects,
+        mock_get_card_state,
+        mock_dedup,
+        mock_cancel_wiki,
+        mock_feishu_cls,
+        mock_release_note,
+    ):
+        mock_load_cfg.return_value = {"feishu": {"app_id": "cli_a", "app_secret": "sec"}, "projects": []}
+        mock_get_projects.return_value = []
+        mock_get_card_state.return_value = None
+        mock_dedup.return_value = True
+
+        mock_feishu = AsyncMock()
+        mock_feishu.get_user_name.return_value = "赵六"
+        mock_feishu.update_card.return_value = {"code": 0}
+        mock_feishu_cls.return_value = mock_feishu
+
+        # 情况 A：正常取消活跃任务
+        mock_cancel_wiki.return_value = {"ok": True, "stale_unlocked": False, "msg": "🛑 已发送取消指令，正在停止生成..."}
+        req = MagicMock()
+        req.json = AsyncMock(
+            return_value={
+                "event": {
+                    "operator": {"open_id": "ou_zhao", "operator_id": {"open_id": "ou_zhao"}},
+                    "action": {
+                        "tag": "button",
+                        "value": {
+                            "action": "cancel_wiki",
+                            "lock_scope": "18:main:all",
+                            "operator_open_id": "ou_dev_1",
+                            "project": "Kitefly",
+                            "repo": "前端",
+                            "repo_id": 18,
+                            "branch": "main",
+                        },
+                    },
+                    "context": {"open_message_id": "om_wiki_1", "open_chat_id": "oc_group_1"},
+                }
+            }
+        )
+        resp = await feishu_card(req)
+        data = json.loads(resp.body.decode("utf-8"))
+        self.assertEqual(data["toast"]["type"], "success")
+        mock_cancel_wiki.assert_awaited_once_with("18:main:all", canceler_open_id="ou_zhao", canceler_name="赵六")
+        mock_feishu.update_card.assert_not_called()
+
+        # 情况 B：遗留僵尸锁 -> 自动更新旧进度卡片为已取消状态
+        mock_cancel_wiki.reset_mock()
+        mock_cancel_wiki.return_value = {"ok": True, "stale_unlocked": True, "msg": "🛑 原后台任务已结束，已释放并发锁"}
+        resp2 = await feishu_card(req)
+        data2 = json.loads(resp2.body.decode("utf-8"))
+        self.assertEqual(data2["toast"]["type"], "success")
+        mock_feishu.update_card.assert_awaited_once()
+        msg_id, updated_card = mock_feishu.update_card.call_args[0]
+        self.assertEqual(msg_id, "om_wiki_1")
+        self.assertEqual(updated_card["header"]["template"], "orange")
 
 
 if __name__ == "__main__":

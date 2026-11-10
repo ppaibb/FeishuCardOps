@@ -24,7 +24,13 @@ from core.feishu_client import FeishuClient
 from core.gitlab_client import GitLabClient
 from core.metrics import WIKI_GEN_COMPLETED, WIKI_GEN_DURATION, WIKI_GEN_TRIGGERED
 from core.redis_client import get_redis
-from core.state import unlock_wiki
+from core.state import (
+    clear_wiki_cancel,
+    get_wiki_cancel_info,
+    is_wiki_locked,
+    request_wiki_cancel,
+    unlock_wiki,
+)
 from core.wiki_engine import (
     DEFAULT_CONTEXT_CHARS,
     DEFAULT_MAX_BYTES,
@@ -40,6 +46,37 @@ from core.wiki_engine import (
 )
 
 logger = logging.getLogger("feishu_gitlab_card_http")
+
+# 当前进程内正在运行的 RepoWiki 后台任务映射（lock_scope -> asyncio.Task）
+_running_wiki_tasks: Dict[str, asyncio.Task] = {}
+
+
+async def cancel_running_wiki(
+    lock_scope: str,
+    canceler_open_id: str = "",
+    canceler_name: str = "",
+) -> Dict[str, Any]:
+    """取消正在进行的 RepoWiki 生成任务（同时清理重启遗留锁）"""
+    task = _running_wiki_tasks.get(lock_scope)
+    locked = await is_wiki_locked(lock_scope)
+    if (task is None or task.done()) and not locked:
+        return {"ok": False, "stale_unlocked": False, "msg": "当前 RepoWiki 任务已结束或未在运行中"}
+
+    existing = await get_wiki_cancel_info(lock_scope)
+    if existing and task and not task.done():
+        return {"ok": True, "stale_unlocked": False, "msg": "⏳ 正在中止 RepoWiki 任务，请稍候..."}
+
+    await request_wiki_cancel(
+        lock_scope,
+        {"canceled_by": canceler_open_id, "canceled_by_name": canceler_name},
+    )
+    if task and not task.done():
+        task.cancel()
+        return {"ok": True, "stale_unlocked": False, "msg": "🛑 已发送取消指令，正在停止生成..."}
+
+    await unlock_wiki(lock_scope)
+    await clear_wiki_cancel(lock_scope)
+    return {"ok": True, "stale_unlocked": True, "msg": "🛑 原后台任务已结束，已释放并发锁"}
 
 
 def build_wiki_lock_scope(
@@ -307,6 +344,16 @@ async def background_run_wiki(
     sub_message_ids: List[str] = []
     commit_sha = ""
     commit_url = ""
+    current_stage = {"text": "🔎 正在校验提交基线与增量缓存..."}
+    canceling_flag = {"active": False}
+    current_task = asyncio.current_task()
+    ticker_task: Optional[asyncio.Task] = None
+
+    if current_task:
+        _running_wiki_tasks[lock_scope] = current_task
+
+    def _elapsed() -> float:
+        return max(0.0, asyncio.get_event_loop().time() - start_time)
 
     async def _send_or_update_cards(card: Dict[str, Any]) -> None:
         if not sub_message_ids:
@@ -335,7 +382,65 @@ async def background_run_wiki(
             except Exception as e:
                 logger.warning("update wiki card failed msg_id=%s err=%s", mid, e)
 
+    async def _push_running_card(stage_text: str) -> None:
+        if await get_wiki_cancel_info(lock_scope):
+            raise asyncio.CancelledError()
+        current_stage["text"] = stage_text
+        await _send_or_update_cards(
+            build_wiki_card(
+                state=state,
+                operator_open_id=operator_open_id,
+                w_status="running",
+                stage_text=stage_text,
+                commit_sha=commit_sha,
+                commit_url=commit_url,
+                lock_scope=lock_scope,
+                result_info={
+                    "subpath": subpath,
+                    "wiki_dir": wiki_dir,
+                    "lock_scope": lock_scope,
+                    "elapsed_seconds": _elapsed(),
+                },
+            )
+        )
+
+    async def _progress_ticker() -> None:
+        while True:
+            await asyncio.sleep(15)
+            if canceling_flag["active"]:
+                return
+            if await get_wiki_cancel_info(lock_scope):
+                if current_task and not current_task.done() and not canceling_flag["active"]:
+                    current_task.cancel()
+                return
+            await _send_or_update_cards(
+                build_wiki_card(
+                    state=state,
+                    operator_open_id=operator_open_id,
+                    w_status="running",
+                    stage_text=current_stage["text"],
+                    commit_sha=commit_sha,
+                    commit_url=commit_url,
+                    lock_scope=lock_scope,
+                    result_info={
+                        "subpath": subpath,
+                        "wiki_dir": wiki_dir,
+                        "lock_scope": lock_scope,
+                        "elapsed_seconds": _elapsed(),
+                    },
+                )
+            )
+
+    async def _stop_ticker() -> None:
+        nonlocal ticker_task
+        if ticker_task and not ticker_task.done():
+            ticker_task.cancel()
+            await asyncio.gather(ticker_task, return_exceptions=True)
+        ticker_task = None
+
     try:
+        await clear_wiki_cancel(lock_scope)
+
         ai_cfg = cfg.get("ai") or {}
         api_key = str(ai_cfg.get("api_key") or "").strip()
         base_url = str(ai_cfg.get("base_url") or "").strip()
@@ -345,6 +450,7 @@ async def background_run_wiki(
                 state=state,
                 operator_open_id=operator_open_id,
                 w_status="failed",
+                result_info={"subpath": subpath, "wiki_dir": wiki_dir, "elapsed_seconds": _elapsed()},
                 error_info="未在 config.yaml 中配置 `ai.api_key` 或 `ai.model`，无法生成 RepoWiki。",
             )
             await _send_or_update_cards(err_card)
@@ -366,6 +472,7 @@ async def background_run_wiki(
                 state=state,
                 operator_open_id=operator_open_id,
                 w_status="failed",
+                result_info={"subpath": subpath, "wiki_dir": wiki_dir, "elapsed_seconds": _elapsed()},
                 error_info=f"未能获取分支 `{branch}` 的最新提交记录，请检查分支是否存在。",
             )
             await _send_or_update_cards(err_card)
@@ -412,31 +519,27 @@ async def background_run_wiki(
                     names = {item.get("name") for item in tree}
                     if "README.md" in names or "repowiki-metadata.json" in names:
                         final_status = "skipped"
+                        skipped_info = {**cached_base, "elapsed_seconds": _elapsed()}
                         skipped_card = build_wiki_card(
                             state=state,
                             operator_open_id=operator_open_id,
                             w_status="skipped",
                             commit_sha=commit_sha,
                             commit_url=commit_url,
-                            result_info=cached_base,
+                            result_info=skipped_info,
                         )
                         if open_chat_id:
                             await feishu_client.send_card(open_chat_id, skipped_card)
                         return
 
-        # 3. 发送初始运行卡片（同步至当前会话及审计群）
-        await _send_or_update_cards(
-            build_wiki_card(
-                state=state,
-                operator_open_id=operator_open_id,
-                w_status="running",
-                stage_text="📦 正在拉取 GitLab 仓库快照并提取源码...",
-                commit_sha=commit_sha,
-                commit_url=commit_url,
-                result_info={"subpath": subpath, "wiki_dir": wiki_dir},
-            )
-        )
+        # 3. 发送初始运行卡片（同步至当前会话及审计群），启动耗时心跳刷新
+        await _push_running_card("📦 正在拉取 GitLab 仓库快照并提取源码...")
+        ticker_task = asyncio.create_task(_progress_ticker())
+
         archive_bytes = await gitlab_client.download_repository_archive(project_id, commit_sha)
+        if await get_wiki_cancel_info(lock_scope):
+            raise asyncio.CancelledError()
+
         source = scan_archive_bytes(
             archive_bytes=archive_bytes,
             branch=branch,
@@ -455,6 +558,14 @@ async def background_run_wiki(
             max_output_tokens=settings["max_output_tokens"],
         )
 
+        async def _guarded_model_call(purpose: str, instructions: str, context: Dict[str, Any]) -> str:
+            if await get_wiki_cancel_info(lock_scope):
+                raise asyncio.CancelledError()
+            res = await llm.call(purpose, instructions, context)
+            if await get_wiki_cancel_info(lock_scope):
+                raise asyncio.CancelledError()
+            return res
+
         async def _stage_cache_get(stage_name: str, item_id: str, sig: str) -> Optional[Any]:
             if force or not redis:
                 return None
@@ -470,24 +581,11 @@ async def background_run_wiki(
             key = f"cardops:wiki_stage:{project_id}:{branch}:{stage_name}:{item_id}:{sig[:16]}"
             await redis.set(key, json.dumps(val, ensure_ascii=False), ex=86400)
 
-        async def _on_progress(stage_text: str) -> None:
-            await _send_or_update_cards(
-                build_wiki_card(
-                    state=state,
-                    operator_open_id=operator_open_id,
-                    w_status="running",
-                    stage_text=stage_text,
-                    commit_sha=commit_sha,
-                    commit_url=commit_url,
-                    result_info={"subpath": subpath, "wiki_dir": wiki_dir},
-                )
-            )
-
         repo_display = state.get("repo_path") or state.get("repo") or str(project_id)
         bundle = await generate_wiki_bundle(
             source=source,
             repo_name=repo_display,
-            model_call=llm.call,
+            model_call=_guarded_model_call,
             wiki_dir=wiki_dir,
             locale=settings["locale"],
             model_name=model_name,
@@ -495,11 +593,14 @@ async def background_run_wiki(
             context_chars=settings["context_chars"],
             stage_cache_get=_stage_cache_get,
             stage_cache_set=_stage_cache_set,
-            progress_cb=_on_progress,
+            progress_cb=_push_running_card,
         )
 
         # 6. 写回 GitLab 仓库（直推优先，400/403 保护分支自动切 MR）
-        await _on_progress("📤 正在将生成的 RepoWiki 写回 GitLab 代码仓库...")
+        await _push_running_card("📤 正在将生成的 RepoWiki 写回 GitLab 代码仓库...")
+        if await get_wiki_cancel_info(lock_scope):
+            raise asyncio.CancelledError()
+
         write_res = await _commit_wiki_with_fallback(
             gitlab_client=gitlab_client,
             project_id=project_id,
@@ -507,10 +608,11 @@ async def background_run_wiki(
             commit_sha=commit_sha,
             wiki_dir=wiki_dir,
             bundle=bundle,
-            progress_cb=_on_progress,
+            progress_cb=_push_running_card,
         )
 
-        elapsed = asyncio.get_event_loop().time() - start_time
+        await _stop_ticker()
+        elapsed = _elapsed()
         result_info = {
             "wiki_dir": wiki_dir,
             "subpath": subpath,
@@ -546,7 +648,33 @@ async def background_run_wiki(
             )
         )
 
+    except asyncio.CancelledError:
+        final_status = "canceled"
+        canceling_flag["active"] = True
+        await _stop_ticker()
+        cancel_info = (await get_wiki_cancel_info(lock_scope)) or {}
+        logger.info("background_run_wiki canceled scope=%s by=%s", lock_scope, cancel_info.get("canceled_by"))
+        try:
+            await _send_or_update_cards(
+                build_wiki_card(
+                    state=state,
+                    operator_open_id=operator_open_id,
+                    w_status="canceled",
+                    stage_text=current_stage["text"],
+                    commit_sha=commit_sha,
+                    commit_url=commit_url,
+                    result_info={
+                        "subpath": subpath,
+                        "wiki_dir": wiki_dir,
+                        "elapsed_seconds": _elapsed(),
+                        **cancel_info,
+                    },
+                )
+            )
+        except Exception as e:
+            logger.warning("failed updating canceled wiki card scope=%s err=%s", lock_scope, e)
     except httpx.HTTPStatusError as exc:
+        await _stop_ticker()
         detail = ""
         try:
             detail = exc.response.text[:260]
@@ -560,10 +688,12 @@ async def background_run_wiki(
                 w_status="failed",
                 commit_sha=commit_sha,
                 commit_url=commit_url,
+                result_info={"subpath": subpath, "wiki_dir": wiki_dir, "elapsed_seconds": _elapsed()},
                 error_info=f"GitLab API 请求失败 (HTTP {exc.response.status_code})：{detail}",
             )
         )
     except Exception as exc:
+        await _stop_ticker()
         logger.exception("background_run_wiki failed: %s", exc)
         await _send_or_update_cards(
             build_wiki_card(
@@ -572,12 +702,17 @@ async def background_run_wiki(
                 w_status="failed",
                 commit_sha=commit_sha,
                 commit_url=commit_url,
+                result_info={"subpath": subpath, "wiki_dir": wiki_dir, "elapsed_seconds": _elapsed()},
                 error_info=str(exc),
             )
         )
     finally:
+        await _stop_ticker()
+        if current_task and _running_wiki_tasks.get(lock_scope) is current_task:
+            _running_wiki_tasks.pop(lock_scope, None)
+        await clear_wiki_cancel(lock_scope)
         await unlock_wiki(lock_scope)
-        elapsed = asyncio.get_event_loop().time() - start_time
+        elapsed = _elapsed()
         WIKI_GEN_COMPLETED.labels(
             project=state.get("project", ""),
             repo=state.get("repo", ""),

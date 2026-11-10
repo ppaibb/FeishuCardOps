@@ -139,7 +139,7 @@ async def process_text_message(text: str, chat_id: str, sender_open_id: str = ""
                 if not await try_lock_wiki(lock_scope):
                     await feishu.send_text(
                         chat_id,
-                        f"📚 `{state['project']} - {state['repo']} ({state['branch']})` 正在生成 RepoWiki，请稍候...",
+                        f"📚 `{state['project']} - {state['repo']} ({state['branch']})` 正在生成 RepoWiki，如需中止可点击进度卡上的「🛑 取消生成」",
                     )
                     return
 

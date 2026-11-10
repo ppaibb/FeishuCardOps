@@ -13,6 +13,7 @@ from core.card_builder import (
     build_project_management_card,
     build_sonar_card,
     build_sub_card,
+    build_wiki_card,
     normalize_selection,
 )
 from services.project_manager import get_all_projects, get_dynamic_project_names, DYNAMIC_PROJECTS_KEY
@@ -34,7 +35,7 @@ from core.state import (
 from services.approval import create_approval, get_approval, resolve_approval
 from services.history import get_history
 from services.pipeline import background_run_pipeline, delayed_update_card, next_card_version
-from services.repo_wiki import background_run_wiki, build_wiki_lock_scope
+from services.repo_wiki import background_run_wiki, build_wiki_lock_scope, cancel_running_wiki
 from services.sonar_scan import background_run_sonar, build_sonar_lock_scope
 from core.metrics import (
     CARD_INTERACTION, APPROVAL_RESOLVED, PIPELINE_TRIGGERED,
@@ -92,7 +93,7 @@ async def feishu_card(request: Request):
     open_message_id = context.get("open_message_id") or ""
     open_chat_id = context.get("open_chat_id") or context.get("chat_id") or ""
     operator = event.get("operator", {}) or {}
-    operator_open_id = operator.get("open_id") or ""
+    operator_open_id = operator.get("open_id") or (operator.get("operator_id") or {}).get("open_id") or ""
 
     stored_state = await get_card_state(open_message_id)
 
@@ -109,7 +110,9 @@ async def feishu_card(request: Request):
     if not action_name and action.get("tag") == "button":
         text_obj = action.get("text") or {}
         button_text = text_obj.get("content", "") if isinstance(text_obj, dict) else ""
-        if "执行" in button_text:
+        if "取消生成" in button_text:
+            action_name = "cancel_wiki"
+        elif "执行" in button_text:
             action_name = "run"
         elif "刷新" in button_text:
             action_name = "refresh"
@@ -271,6 +274,64 @@ async def feishu_card(request: Request):
                 logger.error("failed to update sub_card after ack message_id=%s error=%s", target_msg_id, e)
 
         return JSONResponse({"toast": {"type": "success", "content": "✅ 已确认收到！"}})
+
+    # ── 取消 RepoWiki 生成 ────────────────────────────────────────
+    if action_name == "cancel_wiki":
+        if not isinstance(raw_value, dict):
+            return JSONResponse({"toast": {"type": "error", "content": "取消参数无效"}})
+
+        state_dict = stored_state or {}
+        lock_scope = str(raw_value.get("lock_scope") or "").strip()
+        if not lock_scope:
+            repo_id = raw_value.get("repo_id") or state_dict.get("repo_id")
+            branch = raw_value.get("branch") or state_dict.get("branch") or "main"
+            if repo_id:
+                lock_scope = f"{repo_id}:{branch}:all"
+        if not lock_scope:
+            return JSONResponse({"toast": {"type": "error", "content": "参数缺失：未找到 RepoWiki 任务标识"}})
+
+        dedup_key = f"cancel_wiki:{lock_scope}"
+        if not await check_action_dedup(dedup_key, 2):
+            return JSONResponse({"toast": {"type": "info", "content": "正在处理取消请求，请稍候"}})
+
+        feishu_client = FeishuClient(app_id=cfg["feishu"]["app_id"], app_secret=cfg["feishu"]["app_secret"])
+        canceler_name = operator_open_id
+        if operator_open_id:
+            try:
+                canceler_name = await feishu_client.get_user_name(operator_open_id)
+            except Exception:
+                canceler_name = operator_open_id
+
+        res = await cancel_running_wiki(
+            lock_scope,
+            canceler_open_id=operator_open_id,
+            canceler_name=canceler_name,
+        )
+        if res.get("stale_unlocked") and open_message_id:
+            card_state = {
+                "project": raw_value.get("project") or state_dict.get("project") or "-",
+                "repo": raw_value.get("repo") or state_dict.get("repo") or "-",
+                "repo_id": raw_value.get("repo_id") or state_dict.get("repo_id") or 0,
+                "branch": raw_value.get("branch") or state_dict.get("branch") or "-",
+                "env": raw_value.get("env") or state_dict.get("env") or "",
+            }
+            canceled_card = build_wiki_card(
+                state=card_state,
+                operator_open_id=str(raw_value.get("operator_open_id") or operator_open_id),
+                w_status="canceled",
+                stage_text="后台任务已离线（并发锁已清理）",
+                result_info={
+                    "canceled_by": operator_open_id,
+                    "canceled_by_name": canceler_name,
+                },
+                lock_scope=lock_scope,
+            )
+            try:
+                await feishu_client.update_card(open_message_id, canceled_card)
+            except Exception as e:
+                logger.warning("failed updating stale canceled wiki card msg_id=%s err=%s", open_message_id, e)
+
+        return JSONResponse({"toast": {"type": "success" if res.get("ok") else "warning", "content": res.get("msg", "")}})
 
     # Collect incoming config variables
     incoming_vars = {}
@@ -482,7 +543,7 @@ async def feishu_card(request: Request):
 
         lock_scope = build_wiki_lock_scope(state, cfg=cfg)
         if not await try_lock_wiki(lock_scope):
-            return JSONResponse({"toast": {"type": "warning", "content": "📚 该目标正在生成 RepoWiki，请稍候..."}})
+            return JSONResponse({"toast": {"type": "warning", "content": "📚 该目标正在生成 RepoWiki，如需中止可点击进度卡上的「🛑 取消生成」"}})
 
         WIKI_GEN_TRIGGERED.labels(project=state["project"], repo=state["repo"]).inc()
         asyncio.create_task(

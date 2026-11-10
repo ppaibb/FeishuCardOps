@@ -5,7 +5,7 @@
 """
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from core.redis_client import get_redis
 
@@ -112,3 +112,59 @@ async def unlock_wiki(lock_scope: str) -> None:
     r = get_redis()
     logger.info("unlocking wiki scope=%s", lock_scope)
     await r.delete(f"wiki_lock:{lock_scope}")
+
+
+async def is_wiki_locked(lock_scope: str) -> bool:
+    if not lock_scope:
+        return False
+    r = get_redis()
+    if not r:
+        return False
+    try:
+        return bool(await r.get(f"wiki_lock:{lock_scope}"))
+    except Exception as e:
+        logger.warning("is_wiki_locked failed scope=%s err=%s", lock_scope, e)
+        return False
+
+
+async def request_wiki_cancel(lock_scope: str, info: Optional[Dict[str, Any]] = None, ttl: int = 300) -> None:
+    if not lock_scope:
+        return
+    r = get_redis()
+    if not r:
+        return
+    payload = {"canceled": True, **(info or {})}
+    try:
+        await r.setex(f"wiki_cancel:{lock_scope}", ttl, json.dumps(payload, ensure_ascii=False))
+    except Exception as e:
+        logger.warning("request_wiki_cancel failed scope=%s err=%s", lock_scope, e)
+
+
+async def get_wiki_cancel_info(lock_scope: str) -> Optional[Dict[str, Any]]:
+    if not lock_scope:
+        return None
+    r = get_redis()
+    if not r:
+        return None
+    try:
+        raw = await r.get(f"wiki_cancel:{lock_scope}")
+        if not raw:
+            return None
+        parsed = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else str(raw))
+        if isinstance(parsed, dict) and parsed.get("canceled") is True:
+            return parsed
+    except Exception as e:
+        logger.warning("get_wiki_cancel_info failed scope=%s err=%s", lock_scope, e)
+    return None
+
+
+async def clear_wiki_cancel(lock_scope: str) -> None:
+    if not lock_scope:
+        return
+    r = get_redis()
+    if not r:
+        return
+    try:
+        await r.delete(f"wiki_cancel:{lock_scope}")
+    except Exception as e:
+        logger.warning("clear_wiki_cancel failed scope=%s err=%s", lock_scope, e)
