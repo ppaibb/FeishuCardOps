@@ -674,6 +674,7 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
             "feishu": {"app_id": "cli_a", "app_secret": "sec"},
             "gitlab": {"base_url": "https://gitlab.example.com", "access_token": "tok"},
             "ai": {"api_key": "sk-test", "base_url": "https://api.example.com", "model": "MiniMax-M2.7"},
+            "permissions": {"admin_users": ["ou_dev_1"]},
             "projects": projects,
         }
         mock_get_projects.return_value = projects
@@ -690,6 +691,32 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
         mock_dedup.return_value = True
         mock_try_lock.return_value = True
 
+        # 情况 A：非管理员点击「生成 Wiki」被拒绝，且不触碰并发锁
+        non_admin_payload = {
+            "event": {
+                "operator": {"open_id": "ou_non_admin", "operator_id": {"open_id": "ou_non_admin"}},
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "repo_wiki",
+                        "project": "Kitefly",
+                        "repo": "前端",
+                        "branch": "main",
+                        "env": "test",
+                    },
+                },
+                "context": {"open_message_id": "om_card_1", "open_chat_id": "oc_group_1"},
+            }
+        }
+        non_admin_req = MagicMock()
+        non_admin_req.json = AsyncMock(return_value=non_admin_payload)
+        non_admin_resp = await feishu_card(non_admin_req)
+        non_admin_data = json.loads(non_admin_resp.body.decode("utf-8"))
+        self.assertEqual(non_admin_data["toast"]["type"], "error")
+        self.assertIn("权限不足", non_admin_data["toast"]["content"])
+        mock_try_lock.assert_not_called()
+
+        # 情况 B：管理员点击「生成 Wiki」正常触发后台生成
         payload = {
             "event": {
                 "operator": {"open_id": "ou_dev_1", "operator_id": {"open_id": "ou_dev_1"}},
@@ -750,6 +777,7 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
             "feishu": {"app_id": "cli_a", "app_secret": "sec"},
             "gitlab": {"base_url": "https://gitlab.example.com", "access_token": "tok"},
             "ai": {"api_key": "sk-test", "base_url": "https://api.example.com", "model": "MiniMax-M2.7"},
+            "permissions": {"admin_users": ["ou_1"]},
             "projects": projects,
         }
         mock_get_projects.return_value = projects
@@ -769,6 +797,14 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
             "variables_def": [],
             "variables": {},
         }
+
+        # 非管理员发文本指令触发 Wiki -> 直接提示权限不足并拦截
+        await process_text_message("kitefly 前端 生成wiki", "oc_1", "ou_guest")
+        mock_feishu.send_text.assert_awaited_once()
+        self.assertIn("权限不足", mock_feishu.send_text.call_args[0][1])
+        mock_try_lock.assert_not_called()
+        mock_bg_wiki.assert_not_called()
+        mock_feishu.send_text.reset_mock()
 
         # 情况 A：明确目标 -> 直接锁定并触发后台任务
         mock_extract_wiki.return_value = {
@@ -1093,7 +1129,11 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
         mock_feishu_cls,
         mock_release_note,
     ):
-        mock_load_cfg.return_value = {"feishu": {"app_id": "cli_a", "app_secret": "sec"}, "projects": []}
+        mock_load_cfg.return_value = {
+            "feishu": {"app_id": "cli_a", "app_secret": "sec"},
+            "permissions": {"admin_users": ["ou_zhao"]},
+            "projects": [],
+        }
         mock_get_projects.return_value = []
         mock_get_card_state.return_value = None
         mock_dedup.return_value = True
@@ -1102,6 +1142,30 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
         mock_feishu.get_user_name.return_value = "赵六"
         mock_feishu.update_card.return_value = {"code": 0}
         mock_feishu_cls.return_value = mock_feishu
+
+        # 情况 0：非管理员点击取消按钮 -> 拒绝且不调用 cancel_running_wiki
+        non_admin_cancel_req = MagicMock()
+        non_admin_cancel_req.json = AsyncMock(
+            return_value={
+                "event": {
+                    "operator": {"open_id": "ou_guest", "operator_id": {"open_id": "ou_guest"}},
+                    "action": {
+                        "tag": "button",
+                        "value": {
+                            "action": "cancel_wiki",
+                            "lock_scope": "18:main:all",
+                            "operator_open_id": "ou_dev_1",
+                        },
+                    },
+                    "context": {"open_message_id": "om_wiki_1", "open_chat_id": "oc_group_1"},
+                }
+            }
+        )
+        deny_resp = await feishu_card(non_admin_cancel_req)
+        deny_data = json.loads(deny_resp.body.decode("utf-8"))
+        self.assertEqual(deny_data["toast"]["type"], "error")
+        self.assertIn("权限不足", deny_data["toast"]["content"])
+        mock_cancel_wiki.assert_not_called()
 
         # 情况 A：正常取消活跃任务
         mock_cancel_wiki.return_value = {"ok": True, "stale_unlocked": False, "msg": "🛑 已发送取消指令，正在停止生成..."}

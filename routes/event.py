@@ -81,6 +81,11 @@ async def process_text_message(text: str, chat_id: str, sender_open_id: str = ""
             or ("wiki" in lowered_text and "发版" not in text and "发布" not in text)
         )
         if is_wiki_cmd:
+            from core.permissions import is_admin
+            if not is_admin(cfg, sender_open_id):
+                await feishu.send_text(chat_id, "❌ 权限不足：您不是卡片管理员，无法触发 RepoWiki 生成")
+                return
+
             cfg["projects"] = await get_all_projects()
             if not cfg["projects"]:
                 await feishu.send_text(chat_id, "❌ 尚未配置任何项目，请先添加项目后再生成 RepoWiki。")
