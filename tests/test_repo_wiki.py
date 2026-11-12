@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import anthropic
 
 from core.card_builder import build_card, build_wiki_card, format_duration
 from core.wiki_engine import (
@@ -13,6 +14,8 @@ from core.wiki_engine import (
     DEFAULT_FILE_CHAR_LIMIT,
     DEFAULT_MAX_OUTPUT_TOKENS,
     AnthropicWikiModel,
+    WikiAccessError,
+    WikiTransientError,
     build_material,
     compute_wiki_config_hash,
     generate_wiki_bundle,
@@ -402,6 +405,109 @@ class TestWikiScannerAndEngine(unittest.IsolatedAsyncioTestCase):
             "docs/repowiki/knowledge/frontend-architecture-and-design-system/overview.md",
             bundle["files"],
         )
+
+    @patch("core.wiki_engine.asyncio.sleep", new_callable=AsyncMock)
+    async def test_wiki_page_partial_degradation_and_systemic_abort(self, mock_sleep):
+        archive = _make_tar_gz(
+            {
+                "README.md": "# Multi\n",
+                "src/alpha.py": "def alpha():\n    return 1\n",
+                "src/beta.py": "def beta():\n    return 2\n",
+                "src/gamma.py": "def gamma():\n    return 3\n",
+            }
+        )
+        source = scan_archive_bytes(archive, branch="main", commit_sha="deg123")
+        sections_def = [
+            {"id": "alpha", "title": "Alpha 模块", "goal": "处理 Alpha", "files": ["src/alpha.py"]},
+            {"id": "beta", "title": "Beta 模块", "goal": "处理 Beta", "files": ["src/beta.py"]},
+            {"id": "gamma", "title": "Gamma 模块", "goal": "处理 Gamma", "files": ["src/gamma.py"]},
+        ]
+
+        # 场景 1：3 个专题中有 1 个失败（<=50%），且使用 WikiTransientError 验证指数退避间隔
+        alpha_page_attempts = {"n": 0}
+
+        async def one_failing_llm(purpose, instructions, ctx):
+            if purpose == "wiki.overview":
+                return "# 多模块总览\n\n入口见 `README.md:1` 与 `src/alpha.py:1`。" + ("总览证据补充内容。\n" * 8)
+            if purpose == "wiki.catalogue":
+                return json.dumps({"sections": sections_def}, ensure_ascii=False)
+            if purpose == "wiki.page":
+                sid = ctx["section"]["id"]
+                if sid == "alpha":
+                    alpha_page_attempts["n"] += 1
+                    raise WikiTransientError("AI 模型调用暂时失败: 429 Too Many Requests")
+                fpath = ctx["section"]["files"][0]
+                return f"# {ctx['section']['title']}\n\n实现位于 `{fpath}:1`。" + ("完整模块技术分析补充。\n" * 10)
+            if purpose == "cards.module":
+                sid = ctx["section"]["id"]
+                fpath = ctx["section"]["files"][0]
+                self.assertNotEqual(sid, "alpha")
+                return json.dumps(
+                    {
+                        "cards": [
+                            {
+                                "type": "overview",
+                                "title": f"{sid} 概览",
+                                "content": f"# {sid} 概览\n\n核心代码位于 `{fpath}:1`，结构独立且边界明确，封装主要业务处理逻辑与输入校验流程。",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            raise AssertionError(purpose)
+
+        bundle = await generate_wiki_bundle(
+            source=source,
+            repo_name="foundation/deg",
+            model_call=one_failing_llm,
+            max_pages=0,
+            concurrency=2,
+        )
+        self.assertEqual(alpha_page_attempts["n"], 3)
+        # WikiTransientError 第1/2次重试分别等待 5s、10s
+        sleep_args = [c[0][0] for c in mock_sleep.await_args_list]
+        self.assertIn(5, sleep_args)
+        self.assertIn(10, sleep_args)
+
+        self.assertEqual(bundle["pages_count"], 4)
+        self.assertEqual(len(bundle["degraded_topics"]), 1)
+        self.assertEqual(bundle["degraded_topics"][0]["id"], "alpha")
+        self.assertIn("局部降级提示", bundle["files"]["docs/repowiki/README.md"])
+        self.assertIn("降级占位", bundle["files"]["docs/repowiki/README.md"])
+        self.assertIn("局部降级提示", bundle["files"]["docs/repowiki/sections/alpha.md"])
+        self.assertIn("src/alpha.py", bundle["files"]["docs/repowiki/sections/alpha.md"])
+        self.assertIn("docs/repowiki/knowledge/alpha/overview.md", bundle["files"])
+        self.assertIn("完整模块技术分析补充", bundle["files"]["docs/repowiki/sections/beta.md"])
+
+        # 场景 2：超过半数专题（2/3）失败 -> 判定系统性故障，中止整次写回
+        async def majority_failing_llm(purpose, instructions, ctx):
+            if purpose == "wiki.page" and ctx["section"]["id"] in {"alpha", "beta"}:
+                raise ValueError("503 upstream overloaded")
+            return await one_failing_llm(purpose, instructions, ctx)
+
+        with self.assertRaises(ValueError) as ctx_err:
+            await generate_wiki_bundle(source=source, repo_name="foundation/deg", model_call=majority_failing_llm, max_pages=0)
+        self.assertIn("超过半数专题生成失败", str(ctx_err.exception))
+
+        # 场景 3：权限/参数错误（WikiAccessError）即使只影响单专题也立即中止，绝不降级掩盖
+        access_attempts = {"n": 0}
+
+        async def access_err_llm(purpose, instructions, ctx):
+            if purpose == "wiki.page" and ctx["section"]["id"] == "alpha":
+                access_attempts["n"] += 1
+                raise WikiAccessError("AI 模型拒绝请求或凭证无效: 401")
+            return await one_failing_llm(purpose, instructions, ctx)
+
+        with self.assertRaises(WikiAccessError):
+            await generate_wiki_bundle(source=source, repo_name="foundation/deg", model_call=access_err_llm, max_pages=0)
+        self.assertEqual(access_attempts["n"], 1)
+
+    async def test_anthropic_wiki_model_maps_transient_sdk_errors(self):
+        llm = AnthropicWikiModel(api_key="sk-test", base_url="https://api.example.com", model="MiniMax-M2.7")
+        req = httpx.Request("POST", "https://api.example.com/v1/messages")
+        llm._client.messages.create = AsyncMock(side_effect=anthropic.APITimeoutError(request=req))
+        with self.assertRaises(WikiTransientError):
+            await llm.call("wiki.page", "Write docs", {"section": {"id": "core"}})
 
 
 class TestGitLabWritebackAndFallback(unittest.IsolatedAsyncioTestCase):
@@ -1327,6 +1433,129 @@ class TestWikiRoutesAndIntent(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://gitlab.example.com/group/demo/-/merge_requests/45", urls)
         self.assertTrue(any("查看 MR !45" in (b.get("text") or {}).get("content", "") for b in action_btns))
         mock_unlock.assert_awaited_once_with("99:feat/auth:all")
+
+    @patch("services.repo_wiki.unlock_wiki", new_callable=AsyncMock)
+    @patch("core.state.get_redis")
+    @patch("services.repo_wiki.get_redis")
+    @patch("services.repo_wiki.AnthropicWikiModel")
+    async def test_background_run_wiki_partial_degradation_commits_and_skips_baseline_cache(
+        self, mock_model_cls, mock_get_redis, mock_state_redis, mock_unlock
+    ):
+        kv_store = {}
+
+        async def r_get(key):
+            return kv_store.get(key)
+
+        async def r_set(key, val, ex=None):
+            kv_store[key] = val
+            return True
+
+        async def r_setex(key, ttl, val):
+            kv_store[key] = val
+            return True
+
+        mock_redis = AsyncMock()
+        mock_redis.get.side_effect = r_get
+        mock_redis.set.side_effect = r_set
+        mock_redis.setex.side_effect = r_setex
+        mock_get_redis.return_value = mock_redis
+        mock_state_redis.return_value = mock_redis
+
+        async def partial_llm(purpose, instructions, ctx):
+            if purpose == "wiki.overview":
+                return "# 仓库总览\n\n核心代码见 `src/a.py:1` 与 `src/b.py:1`。" + ("补充总览描述信息。\n" * 8)
+            if purpose == "wiki.catalogue":
+                return json.dumps(
+                    {
+                        "sections": [
+                            {"id": "mod-a", "title": "模块 A", "goal": "说明 A", "files": ["src/a.py"]},
+                            {"id": "mod-b", "title": "模块 B", "goal": "说明 B", "files": ["src/b.py"]},
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            if purpose == "wiki.page":
+                if ctx["section"]["id"] == "mod-b":
+                    raise WikiTransientError("AI 模型调用暂时失败: 502 Bad Gateway")
+                return "# 模块 A\n\n入口定义在 `src/a.py:1`。" + ("补充模块流程解析信息。\n" * 10)
+            if purpose == "cards.module":
+                return json.dumps(
+                    {
+                        "cards": [
+                            {
+                                "type": "overview",
+                                "title": "模块 A 概览",
+                                "content": "# 模块 A 概览\n\n入口位于 `src/a.py:1`，主要承担核心业务处理职责，结构清晰独立。",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            raise AssertionError(purpose)
+
+        fake_model_instance = MagicMock()
+        fake_model_instance.calls = 6
+        fake_model_instance.tokens = 2000
+        fake_model_instance.call = AsyncMock(side_effect=partial_llm)
+        mock_model_cls.return_value = fake_model_instance
+
+        feishu = AsyncMock()
+        feishu.send_card.return_value = {"data": {"message_id": "om_partial"}}
+        feishu.update_card.return_value = {"code": 0}
+
+        gitlab = AsyncMock()
+        gitlab.get_project.return_value = {"web_url": "https://gitlab.example.com/group/demo"}
+        gitlab.get_branch.return_value = {"commit": {"id": "sha_partial_1"}}
+        gitlab.download_repository_archive.return_value = _make_tar_gz(
+            {"README.md": "# Demo\n", "src/a.py": "def a():\n    return 1\n", "src/b.py": "def b():\n    return 2\n"}
+        )
+        gitlab.list_repository_tree.return_value = []
+        gitlab.create_commit.return_value = {
+            "id": "sha_wiki_partial",
+            "web_url": "https://gitlab.example.com/group/demo/-/commit/sha_wiki_partial",
+        }
+
+        cfg = {
+            "ai": {"api_key": "sk-test", "base_url": "https://api.example.com", "model": "MiniMax-M2.7"},
+            "feishu": {},
+            "projects": [],
+        }
+        state = {"project": "Demo", "repo": "后端", "repo_id": 108, "branch": "main", "env": "test"}
+
+        orig_sleep = asyncio.sleep
+
+        async def fast_retry_sleep(delay, *args, **kwargs):
+            # 保留心跳循环的 15s 睡眠防止事件循环空转，仅加速重试退避睡眠
+            if delay >= 15:
+                return await orig_sleep(delay)
+            return await orig_sleep(0)
+
+        with patch("core.wiki_engine.asyncio.sleep", side_effect=fast_retry_sleep):
+            await background_run_wiki(
+                feishu_client=feishu,
+                gitlab_client=gitlab,
+                cfg=cfg,
+                state=state,
+                operator_open_id="ou_dev",
+                open_chat_id="oc_dev",
+                lock_scope="108:main:all",
+                force=False,
+            )
+
+        # 健康专题照常写回仓库，结果卡片提示局部降级
+        gitlab.create_commit.assert_awaited_once()
+        last_card = feishu.update_card.call_args_list[-1][0][1]
+        self.assertEqual(last_card["header"]["template"], "green")
+        last_md = "\n".join(e.get("content", "") for e in last_card["elements"] if e.get("tag") == "markdown")
+        self.assertIn("局部降级", last_md)
+        self.assertIn("模块 B", last_md)
+        self.assertIn("降级占位", last_md)
+
+        # 关键兜底：局部降级时不写 baseline 缓存（防止下次误判跳过），但保留健康专题 24h stage 缓存以便续跑补全
+        self.assertFalse(any(k.startswith("wiki_baseline:") for k in kv_store))
+        self.assertTrue(any(":page:mod-a:" in k for k in kv_store))
+        self.assertFalse(any(":page:mod-b:" in k for k in kv_store))
+        mock_unlock.assert_awaited_once_with("108:main:all")
 
 
 if __name__ == "__main__":

@@ -727,12 +727,23 @@ def build_wiki_card(
 
         detail_sections.append("\n".join(stats_lines))
 
+        degraded_topics = result.get("degraded_topics") or []
+        degraded_ids = {d.get("id") for d in degraded_topics if isinstance(d, dict) and d.get("id")}
+        if degraded_topics:
+            d_names = "、".join(str(d.get("title") or d.get("id") or "") for d in degraded_topics[:3])
+            if len(degraded_topics) > 3:
+                d_names += f" 等 {len(degraded_topics)} 篇"
+            detail_sections.append(
+                f"⚠️ **局部降级（{len(degraded_topics)} 篇）**：{d_names} 因模型调用异常暂以占位页交付，其余专题正常写回（重新点击「📚 生成 Wiki」可复用健康缓存并仅重试异常页）"
+            )
+
         topics = result.get("topics") or []
         if topics:
             shown_topics = topics[:20]
             topic_lines = [f"**📑 已生成专题目录（共 {len(topics)} 篇）**"]
             for idx, t in enumerate(shown_topics, 1):
-                topic_lines.append(f"{idx}. **{t.get('title', t.get('id', '专题'))}** — `{t.get('path', '')}`")
+                mark = " ⚠️ *(降级占位)*" if t.get("id") in degraded_ids else ""
+                topic_lines.append(f"{idx}. **{t.get('title', t.get('id', '专题'))}**{mark} — `{t.get('path', '')}`")
             if len(topics) > len(shown_topics):
                 topic_lines.append(f"…… 其余 {len(topics) - len(shown_topics)} 篇请点击下方「📖 查看 GitLab 文档」浏览完整目录")
             detail_sections.append("\n".join(topic_lines))

@@ -94,6 +94,10 @@ class WikiAccessError(ValueError):
     """不可通过重试恢复的模型鉴权或参数错误。"""
 
 
+class WikiTransientError(ValueError):
+    """限流、超时或连接抖动等可通过拉大退避重试恢复的临时错误。"""
+
+
 def stable_encode(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
@@ -562,6 +566,22 @@ def validate_cards(value: Any, paths: List[str]) -> List[Dict[str, str]]:
     return valid_cards
 
 
+def _build_fallback_section_page(sec: Dict[str, Any], error_msg: str) -> str:
+    """当单篇专题正文经重试仍失败时，生成诚实的降级占位页，确保其余成功专题正常交付。"""
+    title = sec.get("title") or sec.get("id") or "专题"
+    goal = sec.get("goal") or "模块职责梳理"
+    files_list = "\n".join(f"- `{p}`" for p in (sec.get("files") or [])) or "- （无关联文件）"
+    short_err = str(error_msg or "未知错误").strip().splitlines()[0][:240]
+    return (
+        f"# {title}\n\n"
+        f"> ⚠️ **局部降级提示**：本专题正文在自动生成阶段经多次重试后仍未成功（`{short_err}`），"
+        "当前仅保留模块职责与关联源码清单，其余已成功专题已正常生成并写回。\n"
+        "> 💡 下次在飞书点击「📚 生成 Wiki」时，已成功专题将直接复用 24h 断点缓存，系统会自动尝试补全本页。\n\n"
+        f"## 模块定位\n\n{goal}\n\n"
+        f"## 关联源码文件清单\n\n{files_list}\n"
+    )
+
+
 def _build_fallback_overview_card(sec: Dict[str, Any], page_md: str) -> List[Dict[str, str]]:
     """当某专题的知识卡片生成耗尽配额或异常时，从已校验的专题正文降级提炼概览卡片，避免整库任务失败。"""
     title = f"{sec.get('title') or '模块'}概览"
@@ -662,7 +682,7 @@ class AnthropicWikiModel:
             except (anthropic.AuthenticationError, anthropic.PermissionDeniedError, anthropic.BadRequestError) as exc:
                 raise WikiAccessError(f"AI 模型拒绝请求或凭证无效: {exc}") from None
             except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APITimeoutError, anthropic.APIStatusError) as exc:
-                raise ValueError(f"AI 模型调用暂时失败: {exc}") from None
+                raise WikiTransientError(f"AI 模型调用暂时失败: {exc}") from None
 
         attempt_tokens = max(512, int(self.max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS))
         message = await _invoke(attempt_tokens, base_system_prompt)
@@ -717,6 +737,7 @@ def render_wiki_bundle(
     wiki_dir: str = DEFAULT_WIKI_DIR,
     locale: str = "zh-CN",
     model_name: str = "",
+    degraded_topics: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """
     将生成结果渲染为 GitLab 友好的 Markdown + JSON 目录集（不包含二进制 .db）。
@@ -730,6 +751,8 @@ def render_wiki_bundle(
     omitted_count = len(source.get("omitted") or [])
 
     cards_by_sec = {sec["id"]: cards for sec, cards in card_groups}
+    degraded_list = list(degraded_topics or [])
+    degraded_ids = {item["id"] for item in degraded_list if item.get("id")}
 
     # 1. 构建主入口 README.md（GitLab 打开 docs/repowiki/ 即自动渲染）
     readme_lines = [
@@ -742,6 +765,9 @@ def render_wiki_bundle(
     ]
     if source.get("subpath"):
         readme_lines.append(f"> **限定子目录**：`{source['subpath']}`")
+    if degraded_list:
+        names = "、".join(d.get("title") or d.get("id", "") for d in degraded_list)
+        readme_lines.append(f"> ⚠️ **局部降级提示**：`{names}` 因模型调用异常暂生成文件清单占位页，其余专题已完整交付。")
     readme_lines.extend([
         "",
         "## 🗂️ 专题目录导航",
@@ -753,6 +779,8 @@ def render_wiki_bundle(
     for page in pages:
         sid = page["id"]
         stitle = page["title"].replace("|", "\\|")
+        if sid in degraded_ids:
+            stitle = f"{stitle} ⚠️ *(降级占位)*"
         sgoal = page["goal"].replace("|", "\\|").replace("\n", " ")
         sec_cards = cards_by_sec.get(sid, [])
         if sec_cards:
@@ -843,6 +871,7 @@ def render_wiki_bundle(
         "pages_count": len(pages) + 1,
         "cards_count": total_cards,
         "topics": [{"id": p["id"], "title": p["title"], "path": f"{clean_dir}/sections/{p['id']}.md"} for p in pages],
+        "degraded_topics": degraded_list,
     }
 
 
@@ -865,6 +894,7 @@ async def generate_wiki_bundle(
     """
     执行完整的「总览 -> 自适应目录规划 -> 并发专题正文 -> 知识卡片」异步生成与校验管线。
     """
+    clean_dir = wiki_dir.strip("/") or DEFAULT_WIKI_DIR
     config_hash = compute_wiki_config_hash(
         locale=locale,
         max_pages=max_pages,
@@ -939,6 +969,11 @@ async def generate_wiki_bundle(
                 return validated
             except WikiAccessError:
                 raise
+            except WikiTransientError as exc:
+                last_err = str(exc)[:300]
+                if attempt == attempts:
+                    raise ValueError(f"阶段 [{stage_name}:{item_id}] 失败: {last_err}") from None
+                await asyncio.sleep(min(5 * attempt, 12))
             except (ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
                 last_err = str(exc)[:300]
                 if attempt == attempts:
@@ -1031,7 +1066,9 @@ async def generate_wiki_bundle(
                 msg = f"✍️ 专题撰写进度：已完成 `{done_count}/{total_sections}`..."
             await progress_cb(msg)
 
-    async def _process_section(idx: int, sec: Dict[str, Any]) -> Tuple[Dict[str, Any], Tuple[Dict[str, Any], List[Dict[str, str]]]]:
+    async def _process_section(
+        idx: int, sec: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Tuple[Dict[str, Any], List[Dict[str, str]]], Optional[Dict[str, str]]]:
         nonlocal done_count
         page_sig = stable_digest([config_hash, sec, overview_md, {p: source["manifest"][p] for p in sec["files"]}])
         sec_context = {
@@ -1062,70 +1099,90 @@ async def generate_wiki_bundle(
                 {**ctx, "validation_feedback": err},
             )
 
+        degraded_info: Optional[Dict[str, str]] = None
         async with sem:
             active_titles[idx] = sec["title"]
             await _emit_section_progress()
             try:
-                page_md = await run_stage(
-                    "page",
-                    sec["id"],
-                    page_sig,
-                    _produce_page,
-                    lambda text, sec_files=sec["files"]: validate_markdown(text, sec_files, minimum=250),
-                    attempts=2,
-                )
-
-                card_sig = stable_digest([page_sig, page_md])
-                card_ctx = {
-                    "section": sec,
-                    "wiki_page": page_md,
-                    **build_material(
-                        source,
-                        sec["files"],
-                        min(context_chars, 24000),
-                        file_char_limit=min(file_char_limit, 6000),
-                        fair_share=True,
-                    ),
-                }
-
-                async def _produce_cards(err: str, ctx: Dict[str, Any] = card_ctx) -> Any:
-                    raw = await model_call(
-                        "cards.module",
-                        (
-                            'Return ONLY a raw JSON object: {"cards":[{"type":"overview","title":"...","content":"# Heading\\n..."}]}. '
-                            "Keep internal reasoning brief and output JSON directly. "
-                            "Create 1..4 high-density standalone knowledge cards using distinct `type` values from: "
-                            "`overview`, `architecture_design`, `tech_stack`, `coding_conventions`. "
-                            "Every card's `content` must start with `#`, cite supplied source paths (`path:line` where visible), "
-                            "and summarize concrete mechanisms, patterns, interfaces or conventions (at least 120 UTF-8 bytes). "
-                            "Omit any type lacking direct evidence."
-                        ),
-                        {**ctx, "validation_feedback": err},
-                    )
-                    return parse_json_result(raw)
-
                 try:
-                    cards = await run_stage(
-                        "cards",
+                    page_md = await run_stage(
+                        "page",
                         sec["id"],
-                        card_sig,
-                        _produce_cards,
-                        lambda val, sec_files=sec["files"]: validate_cards(val, sec_files),
+                        page_sig,
+                        _produce_page,
+                        lambda text, sec_files=sec["files"]: validate_markdown(text, sec_files, minimum=250),
                         attempts=3,
                     )
-                except ValueError as card_exc:
+                except WikiAccessError:
+                    raise
+                except ValueError as page_exc:
                     logger.warning(
-                        "cards stage failed after retries for section=%s, using synthesized fallback card: %s",
+                        "page stage failed after retries for section=%s, using fallback page: %s",
                         sec["id"],
-                        card_exc,
+                        page_exc,
                     )
+                    page_md = _build_fallback_section_page(sec, str(page_exc))
                     cards = _build_fallback_overview_card(sec, page_md)
+                    degraded_info = {
+                        "id": sec["id"],
+                        "title": sec["title"],
+                        "path": f"{clean_dir}/sections/{sec['id']}.md",
+                        "reason": str(page_exc)[:180],
+                    }
+                else:
+                    card_sig = stable_digest([page_sig, page_md])
+                    card_ctx = {
+                        "section": sec,
+                        "wiki_page": page_md,
+                        **build_material(
+                            source,
+                            sec["files"],
+                            min(context_chars, 24000),
+                            file_char_limit=min(file_char_limit, 6000),
+                            fair_share=True,
+                        ),
+                    }
+
+                    async def _produce_cards(err: str, ctx: Dict[str, Any] = card_ctx) -> Any:
+                        raw = await model_call(
+                            "cards.module",
+                            (
+                                'Return ONLY a raw JSON object: {"cards":[{"type":"overview","title":"...","content":"# Heading\\n..."}]}. '
+                                "Keep internal reasoning brief and output JSON directly. "
+                                "Create 1..4 high-density standalone knowledge cards using distinct `type` values from: "
+                                "`overview`, `architecture_design`, `tech_stack`, `coding_conventions`. "
+                                "Every card's `content` must start with `#`, cite supplied source paths (`path:line` where visible), "
+                                "and summarize concrete mechanisms, patterns, interfaces or conventions (at least 120 UTF-8 bytes). "
+                                "Omit any type lacking direct evidence."
+                            ),
+                            {**ctx, "validation_feedback": err},
+                        )
+                        return parse_json_result(raw)
+
+                    try:
+                        cards = await run_stage(
+                            "cards",
+                            sec["id"],
+                            card_sig,
+                            _produce_cards,
+                            lambda val, sec_files=sec["files"]: validate_cards(val, sec_files),
+                            attempts=3,
+                        )
+                    except WikiAccessError:
+                        raise
+                    except ValueError as card_exc:
+                        logger.warning(
+                            "cards stage failed after retries for section=%s, using synthesized fallback card: %s",
+                            sec["id"],
+                            card_exc,
+                        )
+                        cards = _build_fallback_overview_card(sec, page_md)
             finally:
                 active_titles.pop(idx, None)
 
             done_count += 1
             await _emit_section_progress()
-            return ({**sec, "content": page_md}, (sec, cards))
+            return ({**sec, "content": page_md}, (sec, cards), degraded_info)
 
     tasks = [asyncio.create_task(_process_section(idx, sec)) for idx, sec in enumerate(sections, 1)]
     try:
@@ -1139,6 +1196,12 @@ async def generate_wiki_bundle(
 
     pages: List[Dict[str, Any]] = [item[0] for item in results]
     card_groups: List[Tuple[Dict[str, Any], List[Dict[str, str]]]] = [item[1] for item in results]
+    degraded_topics: List[Dict[str, str]] = [item[2] for item in results if item[2] is not None]
+
+    if total_sections > 0 and len(degraded_topics) > total_sections / 2:
+        raise ValueError(
+            f"超过半数专题生成失败（{len(degraded_topics)}/{total_sections}），已中止写回以防提交不完整文档：{degraded_topics[0].get('reason', '')}"
+        )
 
     bundle = render_wiki_bundle(
         repo_name=repo_name,
@@ -1149,6 +1212,7 @@ async def generate_wiki_bundle(
         wiki_dir=wiki_dir,
         locale=locale,
         model_name=model_name,
+        degraded_topics=degraded_topics,
     )
     bundle["config_hash"] = config_hash
     return bundle

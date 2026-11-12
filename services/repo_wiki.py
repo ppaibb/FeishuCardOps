@@ -731,17 +731,24 @@ async def background_run_wiki(
             pages_count=bundle["pages_count"],
             cards_count=bundle["cards_count"],
             topics=bundle["topics"],
+            degraded_topics=bundle.get("degraded_topics") or [],
             model_calls=llm.calls,
             reported_tokens=llm.tokens,
             elapsed_seconds=elapsed,
             **write_res,
         )
 
-        if redis:
+        if redis and not result_info["degraded_topics"]:
             try:
                 await redis.set(baseline_key, json.dumps(result_info, ensure_ascii=False), ex=90 * 86400)
             except Exception as e:
                 logger.warning("save wiki baseline failed repo_id=%s err=%s", project_id, e)
+        elif result_info["degraded_topics"]:
+            logger.info(
+                "skip wiki baseline cache due to partial degradation repo_id=%s degraded=%s",
+                project_id,
+                [d.get("id") for d in result_info["degraded_topics"]],
+            )
 
         final_status = "success"
         await _send_or_update_cards(
