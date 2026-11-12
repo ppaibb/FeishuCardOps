@@ -88,6 +88,11 @@ class TestCardBuilderVariableLabel(unittest.TestCase):
         self.assertIn("**服务**：snowy-biz-app", content)
         self.assertNotIn("选服务", content)
 
+        actions = [a for elem in card["elements"] if elem.get("tag") == "action" for a in elem.get("actions", [])]
+        action_keys = [a.get("value", {}).get("action") for a in actions]
+        self.assertEqual(action_keys, ["approve", "reject"])
+        self.assertNotIn("review", action_keys)
+
 
 if __name__ == "__main__":
     unittest.main()

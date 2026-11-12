@@ -39,7 +39,7 @@ from services.repo_wiki import background_run_wiki, build_wiki_lock_scope, cance
 from services.sonar_scan import background_run_sonar, build_sonar_lock_scope
 from core.metrics import (
     CARD_INTERACTION, APPROVAL_RESOLVED, PIPELINE_TRIGGERED,
-    AI_REVIEW_TRIGGERED, PROJECT_DELETED, APPROVAL_TRIGGERED, ACTIVE_LOCKS,
+    PROJECT_DELETED, APPROVAL_TRIGGERED, ACTIVE_LOCKS,
     SONAR_SCAN_TRIGGERED, WIKI_GEN_TRIGGERED,
 )
 
@@ -410,9 +410,9 @@ async def feishu_card(request: Request):
     logger.info("card action merged state=%s", state)
 
     dedup_key = ""
-    if action_name in {"run", "refresh", "history", "review", "sonar_scan", "repo_wiki", "manage_projects", "delete_project", "cancel_pipeline"}:
+    if action_name in {"run", "refresh", "history", "sonar_scan", "repo_wiki", "manage_projects", "delete_project", "cancel_pipeline"}:
         dedup_key = f"{open_message_id}:{action_name}:{state.get('project')}:{state.get('repo')}:{state.get('branch')}:{state.get('env')}"
-        dedup_window = 4 if action_name in {"run", "review", "sonar_scan", "repo_wiki"} else 2
+        dedup_window = 4 if action_name in {"run", "sonar_scan", "repo_wiki"} else 2
         if not await check_action_dedup(dedup_key, dedup_window):
             logger.info("dedup hit key=%s", dedup_key)
             return JSONResponse({})
@@ -513,12 +513,9 @@ async def feishu_card(request: Request):
             
         return JSONResponse({"toast": {"type": "success", "content": "导出成功，已通过聊天发送给你！"}})
 
-    # ── AI Code Review ────────────────────────────────────────────
+    # ── AI Code Review（已下线，兼容历史卡片防误刷新） ────────────────
     if action_name == "review":
-        from services.code_review import run_code_review
-        AI_REVIEW_TRIGGERED.labels(project=state["project"], repo=state["repo"]).inc()
-        asyncio.create_task(run_code_review(feishu_client, gitlab, state, open_chat_id, operator_open_id))
-        return JSONResponse({"toast": {"type": "info", "content": "🤖 AI 正在审查代码，结果稍后发送到群聊..."}})
+        return JSONResponse({"toast": {"type": "info", "content": "AI Review 功能已下线"}})
 
     # ── SonarQube 代码扫描 ─────────────────────────────────────────
     if action_name == "sonar_scan":

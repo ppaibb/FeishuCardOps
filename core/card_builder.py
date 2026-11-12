@@ -953,22 +953,11 @@ def build_approval_card(
                     "type": "danger",
                     "value": {"action": "reject", "approval_id": approval_id},
                 },
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "🤖 获取 AI 审查报告"},
-                    "value": {
-                        "action": "review",
-                        "project": state["project"],
-                        "repo": state["repo"],
-                        "branch": state["branch"],
-                        "env": state["env"]
-                    },
-                },
             ],
         })
         elements.append({
             "tag": "note",
-            "elements": [{"tag": "plain_text", "content": "⚠️ 发版前建议点击「获取 AI 审查报告」进行风险排查。仅配置的审批人可操作。"}],
+            "elements": [{"tag": "plain_text", "content": "⚠️ 请核对发布信息与影响范围后操作，仅配置的审批人可审批。"}],
         })
     else:
         if status == "approved":
