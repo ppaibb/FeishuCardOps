@@ -196,7 +196,7 @@ async def process_text_message(text: str, chat_id: str, sender_open_id: str = ""
             latest_result_text = "就绪"
             show_details = False
             if any(intent.values()):
-                latest_result_text = "🤖 **AI 已为你预填了参数！** 请核对无误后点击执行触发"
+                latest_result_text = "🤖 **AI 已为你预填了参数！** 请核对无误后点击「✅ 执行发布」"
                 show_details = True
                     
             state = await normalize_selection(

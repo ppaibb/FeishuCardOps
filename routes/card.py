@@ -522,6 +522,9 @@ async def feishu_card(request: Request):
 
     # ── SonarQube 代码扫描 ─────────────────────────────────────────
     if action_name == "sonar_scan":
+        if not is_admin(cfg, operator_open_id):
+            return JSONResponse({"toast": {"type": "error", "content": "权限不足：您不是卡片管理员"}})
+
         if "⚠️" in state["branch"]:
             return JSONResponse({"toast": {"type": "error", "content": "远程分支读取失败，请重新切一次仓库刷出正常分支后再执行！"}})
 

@@ -258,6 +258,10 @@ class TestBuildSonarCardAndMainButton(unittest.TestCase):
         sonar_btns = [a for a in actions if a.get("value", {}).get("action") == "sonar_scan"]
         self.assertEqual(len(sonar_btns), 1)
         self.assertIn("Sonar", sonar_btns[0]["text"]["content"])
+        review_btns = [a for a in actions if a.get("value", {}).get("action") == "review"]
+        self.assertEqual(len(review_btns), 0)
+        run_btns = [a for a in actions if a.get("value", {}).get("action") == "run"]
+        self.assertEqual(run_btns[0]["text"]["content"], "✅ 执行发布")
 
     def test_ok_with_zero_issues_has_no_ack_button(self):
         report = {
@@ -399,6 +403,7 @@ class TestSonarServiceAndRoutes(unittest.IsolatedAsyncioTestCase):
         mock_cfg.return_value = {
             "feishu": {"app_id": "a", "app_secret": "s"},
             "gitlab": {"base_url": "http://gl", "access_token": "t"},
+            "permissions": {"admin_users": ["ou_admin"]},
             "projects": [],
         }
         mock_projects.return_value = []
@@ -416,10 +421,28 @@ class TestSonarServiceAndRoutes(unittest.IsolatedAsyncioTestCase):
         mock_dedup.return_value = True
         mock_try_sonar.return_value = True
 
+        # 非管理员点击 Sonar 扫描 -> 拒绝拦截，不加锁也不触发后台任务
+        non_admin_req = MagicMock()
+        non_admin_req.json = AsyncMock(return_value={
+            "event": {
+                "operator": {"open_id": "ou_tester"},
+                "action": {"tag": "button", "value": {"action": "sonar_scan"}},
+                "context": {"open_message_id": "om_main", "open_chat_id": "oc_group"},
+            }
+        })
+        deny_resp = await feishu_card(non_admin_req)
+        deny_data = json.loads(deny_resp.body.decode("utf-8"))
+        self.assertEqual(deny_data["toast"]["type"], "error")
+        self.assertIn("权限不足", deny_data["toast"]["content"])
+        mock_try_sonar.assert_not_called()
+        mock_try_repo.assert_not_called()
+        mock_bg_sonar.assert_not_called()
+
+        # 管理员点击 Sonar 扫描 -> 正常加锁并触发扫描（不触碰发版锁）
         req = MagicMock()
         req.json = AsyncMock(return_value={
             "event": {
-                "operator": {"open_id": "ou_tester"},
+                "operator": {"open_id": "ou_admin"},
                 "action": {"tag": "button", "value": {"action": "sonar_scan"}},
                 "context": {"open_message_id": "om_main", "open_chat_id": "oc_group"},
             }

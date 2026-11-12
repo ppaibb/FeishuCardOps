@@ -608,7 +608,12 @@ class TestWikiSkipCacheAndFeishuUI(unittest.IsolatedAsyncioTestCase):
         for elem in card.get("elements", []):
             if elem.get("tag") == "action":
                 actions.extend(elem.get("actions", []))
-        self.assertEqual(len(actions), 6)
+        self.assertEqual(len(actions), 5)
+        action_keys = [b.get("value", {}).get("action") for b in actions]
+        self.assertNotIn("review", action_keys)
+        run_btn = [b for b in actions if b.get("value", {}).get("action") == "run"]
+        self.assertEqual(len(run_btn), 1)
+        self.assertEqual(run_btn[0]["text"]["content"], "✅ 执行发布")
         wiki_btn = [b for b in actions if b.get("value", {}).get("action") == "repo_wiki"]
         self.assertEqual(len(wiki_btn), 1)
         self.assertIn("Wiki", wiki_btn[0]["text"]["content"])

@@ -1358,18 +1358,13 @@ def build_card(
         action_elements = [
             {
                 "tag": "button",
-                "text": {"tag": "plain_text", "content": "✅ 执行触发 / 申请发布"},
+                "text": {"tag": "plain_text", "content": "✅ 执行发布"},
                 "type": "primary",
                 "value": {**action_base_val, "action": "run"},
                 "confirm": {
                     "title": {"tag": "plain_text", "content": "⚠️ 发版最终确认"},
-                    "text": {"tag": "plain_text", "content": "您即将直接触发部署流程。\n\n• 如果你已经点过 AI Review，或者确信代码无风险，请点击【确定】。\n• 如果你想先让 AI 把关，请点击【取消】，然后点击旁边的【🤖 AI Review】按钮。\n\n确定要跳过审查、直接发版吗？"}
+                    "text": {"tag": "plain_text", "content": "即将触发所选分支的发布流程（如当前环境配置了审批流将自动发起审批）。\n\n请核对项目、仓库、分支及环境参数无误后点击【确定】继续。"}
                 }
-            },
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "🤖 AI Review"},
-                "value": {**action_base_val, "action": "review"},
             },
             {
                 "tag": "button",
