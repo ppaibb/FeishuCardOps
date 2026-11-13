@@ -277,9 +277,12 @@ permissions:
 | `OPERATOR_NAME` | 触发人飞书中文姓名 | `张三` |
 | `OPERATOR_OPEN_ID` | 触发人飞书 open_id | `ou_505a3130...` |
 
-> 💡 **中文环境映射提示**：
-> 在 `config.yaml` 中，`environments` 字段（如 `test`, `prod`）会被原封不动地传递给流水线（`$ENV`）以确保 CI 脚本不报错。
-> 若期望这些纯英文标识在弹出的飞书交互卡片中显示为更直观的业务中文别名（如 `本地机房`、`阿里云`），请勿直接修改 Config！您只需前往代码文件 `core/card_builder.py`，修改其中的 `get_env_display()` 函数追加一层渲染映射即可。
+> 💡 **多环境与中文别名映射支持**：
+> 在 `config.yaml` 中，`environments` 字段（如 `test`, `prod`, `uat`, `dev` 等）会被原封不动地传递给流水线（`$ENV`）以确保 CI 脚本不报错。
+> 若期望在弹出的飞书卡片中展示直观的业务中文别名，现已**全面支持在 `config.yaml` 中灵活配置**（无需修改代码）：
+> 1. 可在 `config.yaml` 根层级配置全局 `environments.display`（如 `test: "阿里云测试"`, `prod: "阿里云生产"`），所有项目自动继承；
+> 2. 也可在特定项目下配置 `env_display` 进行局部覆盖；
+> 3. 若均未配置，系统会自动采用业界标准语义兜底（`test` ➡️ `测试环境`、`prod` ➡️ `生产环境`、`dev` ➡️ `开发环境`、`uat` ➡️ `UAT环境`、`gray` ➡️ `灰度环境` 等）。
 
 ---
 

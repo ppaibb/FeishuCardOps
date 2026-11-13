@@ -21,15 +21,48 @@ def status_meta(status: str, latest_result_text: str, latest_pipeline_text: str)
     return {"emoji": "🟢", "label": "就绪"}
 
 
-def get_env_display(e: str, display_map: Optional[Dict[str, str]] = None) -> str:
-    # 优先使用项目级自定义映射（config 中 project.env_display），实现按项目区分显示名
+DEFAULT_ENV_DISPLAY_FALLBACK: Dict[str, str] = {
+    "test": "测试环境",
+    "testing": "测试环境",
+    "prod": "生产环境",
+    "production": "生产环境",
+    "release": "生产环境",
+    "online": "生产环境",
+    "dev": "开发环境",
+    "development": "开发环境",
+    "uat": "UAT环境",
+    "sit": "SIT环境",
+    "stage": "预发环境",
+    "staging": "预发环境",
+    "pre": "预发环境",
+    "gray": "灰度环境",
+    "local": "本地环境",
+}
+
+
+def get_env_display(
+    e: str,
+    display_map: Optional[Dict[str, str]] = None,
+    global_display_map: Optional[Dict[str, str]] = None,
+) -> str:
+    """
+    解析环境标识的直观中文展示名。
+    优先级：项目级自定义映射 (display_map) -> 全局映射 (global_display_map) -> 标准语义通用兜底 -> {e}环境
+    """
+    if not e:
+        return ""
+    # 1. 优先使用项目级/合并后的显示映射
     if display_map and e in display_map:
-        return display_map[e]
-    le = e.lower()
-    if le in ["test", "测试"]:
-        return "本地机房"
-    if le in ["prod", "production", "线上", "生产"]:
-        return "阿里云"
+        return str(display_map[e])
+    # 2. 全局环境显示映射
+    if global_display_map and e in global_display_map:
+        return str(global_display_map[e])
+    # 3. 语义化标准兜底（告别旧版硬编码的“本地机房/阿里云”）
+    le = str(e).lower().strip()
+    if le in DEFAULT_ENV_DISPLAY_FALLBACK:
+        return DEFAULT_ENV_DISPLAY_FALLBACK[le]
+    if any(le.endswith(suffix) for suffix in ["环境", "机房", "集群", "测试", "生产"]):
+        return e
     return f"{e}环境"
 
 
@@ -71,8 +104,12 @@ async def normalize_selection(
     force_refresh_branches: bool = False,
 ) -> Dict[str, Any]:
     projects = cfg.get("projects", [])
+    global_env_cfg = cfg.get("environments") or {}
+    global_default_envs = global_env_cfg.get("default") or cfg.get("default_environments") or ["test", "prod"]
+    global_display_map = global_env_cfg.get("display") or cfg.get("env_display") or {}
+
     if not projects:
-        projects = [{"name": "demo", "environments": ["test"], "repos": [{"name": "demo", "repo": "demo", "id": 1}]}]
+        projects = [{"name": "demo", "environments": list(global_default_envs), "repos": [{"name": "demo", "repo": "demo", "id": 1}]}]
 
     project = next((p for p in projects if p["name"] == selected_project), None) or projects[0]
 
@@ -82,9 +119,31 @@ async def normalize_selection(
 
     repo = next((r for r in repos if r["name"] == selected_repo), None) or repos[0]
 
-    env_value = selected_env or project["environments"][0]
-    if env_value not in project["environments"]:
-        env_value = project["environments"][0]
+    # 项目环境列表支持继承全局默认环境
+    project_envs = project.get("environments") or global_default_envs
+    if not isinstance(project_envs, list) or not project_envs:
+        project_envs = list(global_default_envs)
+
+    project_env_display = project.get("env_display") or {}
+    effective_env_display = {**global_display_map, **project_env_display}
+
+    # 解析选中环境：支持传入真实 key (如 test) 或中文别名 (如 "阿里云测试" / "测试环境") 反查出对应 key
+    resolved_env = None
+    if selected_env:
+        if selected_env in project_envs:
+            resolved_env = selected_env
+        else:
+            sel_clean = str(selected_env).strip().lower()
+            for pe in project_envs:
+                pe_clean = str(pe).strip().lower()
+                disp_clean = get_env_display(pe, effective_env_display).strip().lower()
+                if sel_clean in [pe_clean, disp_clean]:
+                    resolved_env = pe
+                    break
+
+    env_value = resolved_env or (selected_env if selected_env in project_envs else project_envs[0])
+    if env_value not in project_envs:
+        env_value = project_envs[0]
 
     # 根据 repo 绑定的实例名解析出对应的 GitLab 客户端；
     # 若 repo 未指定实例或该实例不存在，则回退到调用方传入的客户端。
@@ -125,7 +184,11 @@ async def normalize_selection(
     access_cfg = repo.get("access", {})
     access_urls: List[str] = []
     if isinstance(access_cfg, dict):
-        raw = access_cfg.get(env_value) or access_cfg.get("default")
+        raw = (
+            access_cfg.get(env_value)
+            or access_cfg.get(get_env_display(env_value, effective_env_display))
+            or access_cfg.get("default")
+        )
         if isinstance(raw, str) and raw:
             access_urls = [raw]
         elif isinstance(raw, list):
@@ -139,7 +202,12 @@ async def normalize_selection(
     access_note_raw = repo.get("access_note", "")
     access_note = ""
     if isinstance(access_note_raw, dict):
-        access_note = str(access_note_raw.get(env_value) or access_note_raw.get("default") or "")
+        access_note = str(
+            access_note_raw.get(env_value)
+            or access_note_raw.get(get_env_display(env_value, effective_env_display))
+            or access_note_raw.get("default")
+            or ""
+        )
     elif isinstance(access_note_raw, str):
         access_note = access_note_raw
 
@@ -150,7 +218,7 @@ async def normalize_selection(
         "repo_path": repo["repo"],
         "gitlab_instance": gitlab_instance,
         "sonar_project_key": repo.get("sonar_project_key", ""),
-        "env_display": project.get("env_display", {}),
+        "env_display": effective_env_display,
         "access_urls": access_urls,
         "access_note": access_note,
         "branch": branch_value,
@@ -1011,7 +1079,9 @@ def build_project_management_card(
         for p in all_projects:
             p_name = p["name"]
             repos_str = ", ".join([r["name"] for r in p.get("repos", [])])
-            envs_str = ", ".join(p.get("environments", []))
+            p_envs = p.get("environments") or ["test", "prod"]
+            p_display = {**(state.get("env_display") if isinstance(state, dict) else {}), **(p.get("env_display") or {})}
+            envs_str = ", ".join([f"{e} ({get_env_display(e, p_display)})" if get_env_display(e, p_display) != e else e for e in p_envs])
             
             is_dynamic = p_name in dynamic_project_names
             
@@ -1118,10 +1188,17 @@ def build_card(
         for b in state["branches"]
     ]
 
-    env_display_map = project.get("env_display", {})
+    global_env_cfg = cfg.get("environments") or {}
+    global_default_envs = global_env_cfg.get("default") or cfg.get("default_environments") or ["test", "prod"]
+    global_display_map = global_env_cfg.get("display") or cfg.get("env_display") or {}
+    project_env_display = project.get("env_display") or {}
+    env_display_map = state.get("env_display") or {**global_display_map, **project_env_display}
+    project_envs = project.get("environments") or global_default_envs
+    if not isinstance(project_envs, list) or not project_envs:
+        project_envs = list(global_default_envs)
     env_options_enriched = [
         {"text": {"tag": "plain_text", "content": get_env_display(e, env_display_map)}, "value": e}
-        for e in project["environments"]
+        for e in project_envs
     ]
     env_placeholder = get_env_display(state["env"], env_display_map)
 

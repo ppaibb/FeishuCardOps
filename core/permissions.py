@@ -26,20 +26,31 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger("feishu_gitlab_card_http")
 
 
-def _match_rule(rule: Dict[str, Any], project: str, env: str, repo: str) -> bool:
-    """检查一条规则是否匹配当前项目、环境和仓库"""
+def _match_rule(rule: Dict[str, Any], project: str, env: str, repo: str, env_display: str = "") -> bool:
+    """检查一条规则是否匹配当前项目、环境和仓库（支持按环境原始 key 或中文别名匹配）"""
     rule_project = rule.get("project", "*")
     rule_env = rule.get("env", "*")
     rule_repo = rule.get("repo", "*")
     
     project_match = rule_project == "*" or rule_project == project
-    env_match = rule_env == "*" or rule_env == env
+    
+    env_clean = str(env).strip().lower()
+    rule_env_clean = str(rule_env).strip().lower()
+    disp_clean = str(env_display or "").strip().lower()
+    env_match = (
+        rule_env == "*"
+        or rule_env == env
+        or rule_env_clean == env_clean
+        or (disp_clean and rule_env_clean == disp_clean)
+    )
     repo_match = rule_repo == "*" or rule_repo == repo
     
     return project_match and env_match and repo_match
 
 
-def check_permission(cfg: Dict[str, Any], project: str, env: str, repo: str, operator_open_id: str) -> Tuple[bool, str]:
+def check_permission(
+    cfg: Dict[str, Any], project: str, env: str, repo: str, operator_open_id: str, env_display: str = ""
+) -> Tuple[bool, str]:
     """
     检查用户是否有权限执行发版。
 
@@ -56,7 +67,7 @@ def check_permission(cfg: Dict[str, Any], project: str, env: str, repo: str, ope
     # 从后往前匹配，最后一条匹配的规则优先（更具体的规则应放在后面）
     matched_rule = None
     for rule in reversed(rules):
-        if _match_rule(rule, project, env, repo):
+        if _match_rule(rule, project, env, repo, env_display):
             matched_rule = rule
             break
 
@@ -86,7 +97,9 @@ def check_permission(cfg: Dict[str, Any], project: str, env: str, repo: str, ope
     return True, ""
 
 
-def check_approval_required(cfg: Dict[str, Any], project: str, env: str, repo: str) -> Optional[Dict[str, List[str]]]:
+def check_approval_required(
+    cfg: Dict[str, Any], project: str, env: str, repo: str, env_display: str = ""
+) -> Optional[Dict[str, List[str]]]:
     """
     检查是否需要审批。
 
@@ -104,7 +117,7 @@ def check_approval_required(cfg: Dict[str, Any], project: str, env: str, repo: s
     rule_matched = False
 
     for rule in reversed(approval_rules):
-        if _match_rule(rule, project, env, repo):
+        if _match_rule(rule, project, env, repo, env_display):
             if "approvers" in rule:
                 rule_approvers = rule.get("approvers", []) or []
                 

@@ -39,12 +39,23 @@ async def extract_deploy_intent(text: str, projects_cfg: list) -> Dict[str, Opti
     if not api_key or not model:
         return {}
 
+    global_env_cfg = cfg.get("environments") or {}
+    global_default_envs = global_env_cfg.get("default") or cfg.get("default_environments") or ["test", "prod"]
+    global_display = global_env_cfg.get("display") or cfg.get("env_display") or {}
+
+    from core.card_builder import get_env_display
+
     # 构建上下文
     projects_context = []
     for p in projects_cfg:
         repos = [r["name"] for r in p.get("repos", [])]
-        envs = p.get("environments", [])
-        projects_context.append(f"项目: {p['name']} | 仓库: {repos} | 环境: {envs}")
+        envs = p.get("environments") or global_default_envs
+        p_display = {**global_display, **(p.get("env_display") or {})}
+        formatted_envs = [
+            f"{e}（{get_env_display(e, p_display)}）" if get_env_display(e, p_display) != e else e
+            for e in envs
+        ]
+        projects_context.append(f"项目: {p['name']} | 仓库: {repos} | 环境: {formatted_envs}")
     
     sys_prompt = SYSTEM_PROMPT.replace("{projects_context}", "\n".join(projects_context))
 
